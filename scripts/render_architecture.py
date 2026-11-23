@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-WIDTH, HEIGHT = 1512, 738
+WIDTH, HEIGHT = 1512, 802
 SCALE = 2
 canvas = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), "white")
 draw = ImageDraw.Draw(canvas)
@@ -92,39 +92,48 @@ def group(box, fill, outline, title, subtitle, color):
 
 
 label(44, 43, 'Архитектура телеголосования', 39, ink, True)
-label(45, 89, '100 млн зрителей за 60 секунд', 23, muted)
-group((40, 128, 1472, 452), '#fffaf2', '#ebd3a5', 'Приём голосов', 'Расчётный пик — 5,5 млн POST/с. При совпадении пиков с 5 млн GET/с — 10,5 млн запросов/с.', hot)
-group((40, 479, 960, 715), '#f5f8fd', '#cbdbea', 'Управление опросом', 'До эфира редактор задаёт вопрос и окно голосования.', cold)
-group((980, 479, 1472, 715), '#f3faf8', '#bdded6', 'Подсчёт после эфира', 'Цель — итог в течение 5 минут.', tally)
+label(45, 88, '100 млн зрителей за 60 секунд', 23, muted)
 
-arrow([(550, 595), (550, 465), (777, 465), (777, 317)], cold, 2, True)
-arrow([(240, 278), (365, 278)], hot)
-arrow([(600, 278), (669, 278)], hot)
-arrow([(949, 278), (1080, 278)], hot)
-arrow([(1285, 324), (1285, 366)], hot)
-arrow([(255, 635), (350, 635)], cold)
-arrow([(617, 635), (689, 635)], cold, 3, False, True)
-arrow([(1398, 278), (1435, 278), (1435, 635), (1378, 635)], tally)
-arrow([(1051, 635), (942, 635)], tally)
+group((40, 128, 1472, 519), '#f9fafb', '#d5dce2', 'Публичный API во время эфира',
+      'При совпадении пиков — 5 млн GET/с и 5,5 млн POST/с.', ink)
+group((40, 544, 955, 776), '#f5f8fd', '#cbdbea', 'Управление опросом',
+      'До эфира редактор задаёт вопрос и окно голосования.', cold)
+group((977, 544, 1472, 776), '#f3faf8', '#bdded6', 'Подсчёт после эфира',
+      'Цель — итог в течение 5 минут.', tally)
 
-label(300, 257, 'GET / POST', 17, hot, True, 'mm')
-label(1015, 256, 'INSERT', 17, hot, True, 'mm')
-label(1015, 298, 'по хешу', 17, hot, False, 'mm')
-label(1270, 344, 'синхронная репликация', 17, hot, False, 'rm')
-label(794, 384, 'параметры опроса', 17, cold)
-label(794, 406, 'и карта до эфира', 17, cold)
-label(997, 614, 'итог', 17, tally, True, 'mm')
-label(1420, 570, 'итоги шардов', 17, tally, False, 'rm')
+# Both handlers live inside each API instance.
+rectangle((555, 214, 986, 450), '#ffffff', '#82929e', 14)
+label(770, 243, 'Пул экземпляров Go API', 23, ink, True, 'mm')
+arrow([(220, 343), (276, 343)], muted)
+line([(485, 343), (522, 343)], muted)
+arrow([(522, 343), (522, 306), (578, 306)], cold)
+arrow([(522, 343), (522, 398), (578, 398)], hot)
+arrow([(963, 398), (1090, 398)], hot)
+arrow([(1260, 355), (1260, 304)], hot)
+arrow([(534, 658), (534, 505), (767, 505), (767, 450)], cold, 2, True)
 
-node((68, 240, 240, 317), 'Зрители', 'клиенты API', cold)
-node((365, 240, 600, 317), 'Балансировщик', 'HTTP', hot, '#ffefd4')
-node((669, 240, 949, 317), 'Пул Go API', 'GET — форма из памяти', hot, '#ffefd4')
-database((1080, 232, 1398, 324), 'PostgreSQL', 'пишущие шарды 1 … N', hot, '#ffefd4', 24, 20)
-database((1065, 366, 1398, 435), 'Реплика каждого шарда', 'в другой зоне доступности', hot, '#fff8eb', 20, 17)
-node((68, 598, 255, 671), 'Редактор', 'админка', cold)
-node((350, 595, 617, 675), 'Admin API', 'создание и результаты', cold)
-database((689, 589, 942, 679), 'PostgreSQL', 'опросы и итоги', cold, '#ffffff', 22, 18)
-node((1051, 595, 1378, 676), 'Агрегатор', 'ожидает все шарды', tally, '#ffffff', 24, 19)
+node((64, 303, 220, 383), 'Зритель', 'браузер', cold, large=24)
+node((276, 303, 485, 383), 'Балансировщик', 'HTTPS', muted, large=22)
+node((578, 269, 963, 343), 'GET /p/{id}', 'Форма с вопросом из памяти', cold, '#edf5fc', large=24, small=19)
+node((578, 361, 963, 435), 'POST /api/polls/{id}/votes', 'Проверка и запись бюллетеня', hot, '#fff3e1', large=23, small=19)
+database((1090, 355, 1401, 441), 'PostgreSQL', 'пишущие шарды 1 … N', hot, '#fff3e1', 24, 19)
+database((1090, 227, 1401, 304), 'Реплика каждого шарда', 'в другой зоне доступности', hot, '#fffbf4', 20, 17)
+label(1025, 376, 'INSERT', 17, hot, True, 'mm')
+label(1025, 419, 'по хешу', 17, hot, False, 'mm')
+label(1244, 328, 'синхронная репликация', 17, hot, False, 'rm')
+label(786, 477, 'параметры и карта шардов до эфира', 17, cold)
+
+arrow([(251, 696), (344, 696)], cold)
+arrow([(610, 696), (680, 696)], cold, twoway=True)
+arrow([(1401, 398), (1442, 398), (1442, 696), (1383, 696)], tally)
+arrow([(1050, 696), (935, 696)], tally)
+label(991, 675, 'итог', 17, tally, True, 'mm')
+label(1428, 632, 'итоги шардов', 17, tally, False, 'rm')
+
+node((66, 657, 251, 735), 'Редактор', 'админка', cold)
+node((344, 658, 610, 734), 'Admin API', 'создание и результаты', cold)
+database((680, 651, 935, 741), 'PostgreSQL', 'опросы и итоги', cold, '#ffffff', 22, 18)
+node((1050, 656, 1383, 736), 'Агрегатор', 'ожидает все шарды', tally, '#ffffff', 24, 19)
 
 output = Path(__file__).resolve().parents[1] / "architecture.png"
 canvas.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS).save(output, optimize=True)
