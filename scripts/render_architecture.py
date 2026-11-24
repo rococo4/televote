@@ -144,7 +144,7 @@ database((572, 626, 853, 741), "PostgreSQL", "опросы и агрегаты",
 rectangle((963, 597, 1401, 754), "#ffffff", tally, 13)
 label(1182, 620, "Обработчики на Go", 23, ink, True, "mm")
 label(1182, 650, "Чтение заданных диапазонов партиций", 18, muted, False, "mm")
-label(1182, 678, "Первый голос по ключу зрителя", 18, muted, False, "mm")
+label(1182, 678, "Последний допустимый голос по ключу зрителя", 18, muted, False, "mm")
 draw.line([(982 * SCALE, 701 * SCALE), (1381 * SCALE, 701 * SCALE)],
           fill="#bdded6", width=2 * SCALE)
 label(1182, 727, "Итог по каждой партиции и общий итог", 18, tally, False, "mm")
