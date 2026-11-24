@@ -37,34 +37,7 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-
-	id := uuid.New()
-	topic := "televote-it-" + id.String()
-	brokers := strings.Split(setting("KAFKA_BROKERS", "127.0.0.1:59092"), ",")
-	reader, err := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(reader.Close)
-	createTopic(t, ctx, reader, topic)
-	insertOpenPoll(t, ctx, pool, id, topic)
-
-	writer, err := kafka.New(brokers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(writer.Close)
-	handler, err := app.NewHandler(ctx, pool, writer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+	id, topic, reader, server := newVoteFixture(t, ctx)
 
 	// Pick a nonzero partition so a producer which always writes to 0 fails every run.
 	var token uuid.UUID
@@ -130,6 +103,40 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 		}
 	}
 	t.Logf("2 HTTP 202 responses; consumed 2 votes in %s[%d], offsets %d and %d", topic, wantPartition, records[0].Offset, records[1].Offset)
+}
+
+func newVoteFixture(t *testing.T, ctx context.Context) (uuid.UUID, string, *kgo.Client, *httptest.Server) {
+	t.Helper()
+	pool, err := pgxpool.New(ctx, setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	id := uuid.New()
+	topic := "televote-it-" + id.String()
+	brokers := strings.Split(setting("KAFKA_BROKERS", "127.0.0.1:59092"), ",")
+	reader, err := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reader.Close)
+	createTopic(t, ctx, reader, topic)
+	insertOpenPoll(t, ctx, pool, id, topic)
+
+	writer, err := kafka.New(brokers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(writer.Close)
+	handler, err := app.NewHandler(ctx, pool, writer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	return id, topic, reader, server
 }
 
 func insertOpenPoll(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, topic string) {
