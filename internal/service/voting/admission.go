@@ -1,15 +1,11 @@
 package voting
 
 import (
-	"context"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rococo4/televote/internal/entity"
 )
-
-var ErrStillOpen = errors.New("poll deadline has not passed")
 
 // Admission tracks a complete request through validation and the producer ACK.
 type Admission struct {
@@ -42,33 +38,23 @@ func (s *Service) Begin(pollID uuid.UUID) (*Admission, error) {
 	return &Admission{poll: intake.poll, receivedAt: receivedAt, done: intake.inFlight.Done}, nil
 }
 
-// Seal stops admissions for this poll, then waits for registered handlers.
-// The producer separately waits for any delivery whose HTTP request timed out.
-func (s *Service) Seal(ctx context.Context, id uuid.UUID) (entity.Poll, error) {
+// Seal stops admissions permanently. The returned channel closes when every
+// admitted handler has finished and no more sends can be queued for this poll.
+func (s *Service) Seal(id uuid.UUID) (<-chan struct{}, error) {
 	s.gate.Lock()
+	defer s.gate.Unlock()
 	intake := s.polls[id]
 	if intake == nil {
-		s.gate.Unlock()
-		return entity.Poll{}, ErrPollNotFound
+		return nil, ErrPollNotFound
 	}
 	if intake.sealed == nil {
-		if s.now().Before(intake.poll.ClosesAt) {
-			s.gate.Unlock()
-			return entity.Poll{}, ErrStillOpen
-		}
 		intake.sealed = make(chan struct{})
 		go func() {
 			intake.inFlight.Wait()
 			close(intake.sealed)
 		}()
 	}
-	s.gate.Unlock()
-	select {
-	case <-intake.sealed:
-		return intake.poll, nil
-	case <-ctx.Done():
-		return entity.Poll{}, ctx.Err()
-	}
+	return intake.sealed, nil
 }
 
 // Drain stops new admissions and waits for all registered handlers to finish.

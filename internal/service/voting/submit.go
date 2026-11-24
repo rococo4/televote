@@ -18,6 +18,7 @@ type Publisher interface {
 var (
 	ErrPollNotFound = errors.New("poll not found")
 	ErrUnavailable  = errors.New("vote intake is unavailable")
+	ErrStillOpen    = errors.New("poll deadline has not passed")
 )
 
 type Service struct {

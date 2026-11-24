@@ -56,10 +56,14 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 	if _, err := s.Begin(p.ID); !errors.Is(err, entity.ErrClosed) {
 		t.Fatalf("late admission: got %v", err)
 	}
-	// The cancelled wait can return immediately, but sealing cannot report
-	// success while the already admitted vote is still waiting for Kafka.
-	if _, err := s.Seal(ctx, p.ID); !errors.Is(err, context.Canceled) {
-		t.Fatalf("seal with outstanding publication: got %v", err)
+	drained, err := s.Seal(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drained:
+		t.Fatal("reported drain before the admitted vote finished")
+	default:
 	}
 	elapsed.Store(int64(59 * time.Second)) // A clock correction cannot reopen the sealed poll.
 	if _, err := s.Begin(p.ID); !errors.Is(err, entity.ErrClosed) {
@@ -74,10 +78,7 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	sealed, err := s.Seal(context.Background(), p.ID)
-	if err != nil || sealed.ID != p.ID {
-		t.Fatalf("seal after delivery: poll %s, err %v", sealed.ID, err)
-	}
+	<-drained
 	s.Drain()
 	if _, err := s.Begin(p.ID); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("registration after shutdown: %v", err)

@@ -11,7 +11,6 @@ import (
 
 type Journal interface {
 	TopicID(context.Context, entity.Poll) (uuid.UUID, error)
-	WaitVotes(context.Context, uuid.UUID) error
 	MarkClosed(context.Context, entity.Poll, int32) error
 	ReadPartition(context.Context, entity.Poll, uuid.UUID, int32, func(entity.VoteSubmitted) error) (int64, error)
 }
@@ -44,7 +43,12 @@ func (s *Service) Prepare(ctx context.Context, p entity.Poll) error {
 	return s.results.Bind(ctx, p, id)
 }
 
-// Count is called after the API seals the poll and drains registered handlers.
+func (s *Service) IsFinal(ctx context.Context, p entity.Poll) (bool, error) {
+	final, _, err := s.results.Progress(ctx, p)
+	return final, err
+}
+
+// Count may publish markers only after the shared close decision is durable.
 func (s *Service) Count(ctx context.Context, p entity.Poll) error {
 	final, done, err := s.results.Progress(ctx, p)
 	if err != nil || final {
@@ -70,9 +74,6 @@ func (s *Service) Count(ctx context.Context, p entity.Poll) error {
 		topicID = currentID
 	} else if topicID != currentID {
 		return fmt.Errorf("Kafka topic %s has been replaced", p.Topic)
-	}
-	if err := s.journal.WaitVotes(ctx, p.ID); err != nil {
-		return err
 	}
 	for partition := range int32(p.Partitions) {
 		if !done[partition] {

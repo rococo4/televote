@@ -6,17 +6,85 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rococo4/televote/internal/entity"
+	"github.com/rococo4/televote/internal/repository/closurerepo"
+	"github.com/rococo4/televote/internal/service/voting"
 )
 
 // RunCounting closes published polls at their deadlines and resumes closed polls.
 // It returns when all known results are final or the application is stopping.
 func (h *Handler) RunCounting(ctx context.Context) {
 	var jobs sync.WaitGroup
-	for _, p := range h.polls {
-		jobs.Go(func() { h.finishPoll(ctx, p) })
+	for _, local := range h.polls {
+		jobs.Go(func() { h.finishPoll(ctx, local.poll) })
 	}
 	jobs.Wait()
+}
+
+// CountClosedPoll may be called concurrently on multiple replicas. Every
+// replica must observe the same durable decision before appending a marker.
+func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
+	local, ok := h.polls[id]
+	if !ok {
+		return voting.ErrPollNotFound
+	}
+	p := local.poll
+	if time.Now().Before(p.ClosesAt) {
+		return voting.ErrStillOpen
+	}
+	handlersDone, err := h.voting.Seal(id)
+	if err != nil {
+		return err
+	}
+	if local.joined {
+		if err := h.drainWriter(ctx, p, handlersDone); err != nil {
+			return err
+		}
+	} else {
+		// On restart an older release may already have finalized this poll.
+		// Preserve that result without inventing a retrospective timeout.
+		if final, err := h.counting.IsFinal(ctx, p); err != nil || final {
+			return err
+		}
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ready, err := h.closures.Decide(ctx, p)
+		if err != nil {
+			return err
+		}
+		if ready {
+			return h.counting.Count(ctx, p)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Handler) drainWriter(ctx context.Context, p entity.Poll, handlersDone <-chan struct{}) error {
+	// Apply one absolute budget to both HTTP handlers and outstanding Kafka
+	// callbacks. A stuck send on the last surviving scheduler must not stall it.
+	drainCtx, cancel := context.WithDeadline(ctx, p.ClosesAt.Add(closurerepo.GracePeriod))
+	defer cancel()
+	select {
+	case <-drainCtx.Done():
+		return ctx.Err()
+	case <-handlersDone:
+	}
+	err := h.journal.WaitVotes(drainCtx, p.ID)
+	if drainCtx.Err() != nil {
+		// The grace deadline permits a timeout decision. Caller cancellation does not.
+		return ctx.Err()
+	}
+	if err != nil {
+		return err
+	}
+	return h.closures.Drain(ctx, p, h.writerID)
 }
 
 func (h *Handler) finishPoll(ctx context.Context, p entity.Poll) {

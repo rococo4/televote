@@ -96,6 +96,21 @@ func TestCountVotesAfterClose(t *testing.T) {
 	}
 	checkCountedPoll(t, ctx, f)
 	t.Log("3 HTTP 202s; 4 persisted partition results (2 empty); final 2 ballots, A=0 B=2 before and after restart")
+
+	t.Run("result predating writer registration", func(t *testing.T) {
+		// A final written before migration 003 has no accompanying closure row.
+		if _, err := f.pool.Exec(ctx, "DELETE FROM poll_closures WHERE poll_id=$1 AND version=$2", p.ID, p.Version); err != nil {
+			t.Fatal(err)
+		}
+		if err := restarted.CountClosedPoll(ctx, p.ID); err != nil {
+			t.Fatal(err)
+		}
+		var exists bool
+		if err := f.pool.QueryRow(ctx, "SELECT EXISTS(SELECT FROM poll_closures WHERE poll_id=$1 AND version=$2)", p.ID, p.Version).Scan(&exists); err != nil || exists {
+			t.Fatalf("retroactive close decision: exists=%v err=%v", exists, err)
+		}
+		checkCountedPoll(t, ctx, f)
+	})
 }
 
 func tokenForPartition(p entity.Poll, partition int) string {

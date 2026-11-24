@@ -17,20 +17,36 @@ import (
 	"github.com/rococo4/televote/internal/adapter/kafka"
 	"github.com/rococo4/televote/internal/api/http/votes"
 	"github.com/rococo4/televote/internal/entity"
+	"github.com/rococo4/televote/internal/repository/closurerepo"
 	"github.com/rococo4/televote/internal/repository/pollsrepo"
 	"github.com/rococo4/televote/internal/repository/resultsrepo"
 	"github.com/rococo4/televote/internal/service/counting"
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
+type VoteJournal interface {
+	voting.Publisher
+	counting.Journal
+	Ping(context.Context) error
+	WaitVotes(context.Context, uuid.UUID) error
+}
+
+type localPoll struct {
+	poll   entity.Poll
+	joined bool
+}
+
 type Handler struct {
 	http.Handler
 	voting   *voting.Service
 	counting *counting.Service
-	polls    []entity.Poll
+	polls    map[uuid.UUID]localPoll
+	writerID uuid.UUID
+	closures *closurerepo.Repository
+	journal  VoteJournal
 }
 
-func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Producer) (*Handler, error) {
+func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal) (*Handler, error) {
 	polls, err := pollsrepo.New(pool).LoadPublished(ctx)
 	if err != nil {
 		return nil, err
@@ -40,23 +56,30 @@ func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Produce
 	}
 	service := voting.New(polls, producer, time.Now)
 	counter := counting.New(producer, resultsrepo.New(pool))
+	h := &Handler{
+		Handler: votes.NewHandler(service), voting: service, counting: counter,
+		polls: make(map[uuid.UUID]localPoll, len(polls)), writerID: uuid.New(),
+		closures: closurerepo.New(pool), journal: producer,
+	}
 	for _, p := range polls {
+		var joined bool
 		if time.Now().Before(p.ClosesAt) {
 			if err := counter.Prepare(ctx, p); err != nil {
 				return nil, fmt.Errorf("prepare counting for poll %s: %w", p.ID, err)
 			}
+			joined, err = h.closures.Join(ctx, p, h.writerID)
+			if err != nil {
+				return nil, err
+			}
 		}
+		if !joined {
+			if _, err := service.Seal(p.ID); err != nil {
+				return nil, err
+			}
+		}
+		h.polls[p.ID] = localPoll{poll: p, joined: joined}
 	}
-	return &Handler{Handler: votes.NewHandler(service), voting: service, counting: counter, polls: polls}, nil
-}
-
-// CountClosedPoll resumes a closed poll from its saved partition results.
-func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
-	p, err := h.voting.Seal(ctx, id)
-	if err != nil {
-		return err
-	}
-	return h.counting.Count(ctx, p)
+	return h, nil
 }
 
 func Run(ctx context.Context) error {
@@ -113,7 +136,16 @@ func Run(ctx context.Context) error {
 	}
 	handler.voting.Drain()
 	<-countsDone
-	return errors.Join(err, shutdownErr, producer.Flush(shutdown))
+	flushErr := producer.Flush(shutdown)
+	if flushErr == nil {
+		// A cleanly stopped writer can acknowledge even before the poll ends.
+		for _, local := range handler.polls {
+			if local.joined {
+				shutdownErr = errors.Join(shutdownErr, handler.closures.Drain(shutdown, local.poll, handler.writerID))
+			}
+		}
+	}
+	return errors.Join(err, shutdownErr, flushErr)
 }
 
 func setting(name, fallback string) string {
