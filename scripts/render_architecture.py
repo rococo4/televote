@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 
-WIDTH, HEIGHT = 1512, 802
+WIDTH, HEIGHT = 1512, 810
 SCALE = 2
 canvas = Image.new("RGB", (WIDTH * SCALE, HEIGHT * SCALE), "white")
 draw = ImageDraw.Draw(canvas)
@@ -91,49 +91,63 @@ def group(box, fill, outline, title, subtitle, color):
     label(x + 23, y + 65, subtitle, 18, muted)
 
 
-label(44, 43, 'Архитектура телеголосования', 39, ink, True)
-label(45, 88, '100 млн зрителей за 60 секунд', 23, muted)
+label(44, 43, "Архитектура телеголосования", 39, ink, True)
+label(45, 88, "100 млн голосов за 60 секунд", 23, muted)
 
-group((40, 128, 1472, 519), '#f9fafb', '#d5dce2', 'Публичный API во время эфира',
-      'При совпадении пиков — 3,33 млн GET/с и 3,67 млн POST/с. Суммарно 7 млн запросов/с.', ink)
-group((40, 544, 955, 776), '#f5f8fd', '#cbdbea', 'Управление опросом',
-      'До эфира редактор задаёт вопрос и окно голосования.', cold)
-group((977, 544, 1472, 776), '#f3faf8', '#bdded6', 'Подсчёт после эфира',
-      'Цель — итог в течение 5 минут.', tally)
+group((40, 126, 1472, 480), "#fafbfd", "#d5dce2",
+      "Приём во время эфира",
+      "Расчётный пик с повторами — 3,67 млн POST/с. При совпадении с пиком GET — 7 млн HTTP-запросов/с.", ink)
+group((40, 508, 875, 784), "#f5f8fd", "#cbdbea",
+      "Создание опроса и просмотр результатов",
+      "Редактор задаёт вопрос и границы окна голосования.", cold)
+group((899, 508, 1472, 784), "#f3faf8", "#bdded6",
+      "Подсчёт после закрытия",
+      "Цель — опубликовать результат в течение 5 минут.", tally)
 
-# Both handlers live inside each API instance.
-rectangle((555, 214, 986, 450), '#ffffff', '#82929e', 14)
-label(770, 243, 'Пул экземпляров Go API', 23, ink, True, 'mm')
-arrow([(220, 343), (276, 343)], muted)
-line([(485, 343), (522, 343)], muted)
-arrow([(522, 343), (522, 306), (578, 306)], cold)
-arrow([(522, 343), (522, 398), (578, 398)], hot)
-arrow([(963, 398), (1090, 398)], hot)
-arrow([(1260, 355), (1260, 304)], hot)
-arrow([(534, 658), (534, 505), (767, 505), (767, 450)], cold, 2, True)
+# Public route handlers are roles of the same Go application.
+rectangle((526, 211, 941, 424), "#ffffff", "#82929e", 14)
+label(733, 234, "Пул экземпляров Go API", 22, ink, True, "mm")
+arrow([(205, 321), (253, 321)], muted)
+line([(459, 321), (491, 321)], muted)
+arrow([(491, 321), (491, 289), (546, 289)], cold)
+arrow([(491, 321), (491, 377), (546, 377)], hot)
+arrow([(921, 377), (1092, 377)], hot)
 
-node((64, 303, 220, 383), 'Зритель', 'браузер', cold, large=24)
-node((276, 303, 485, 383), 'Балансировщик', 'HTTPS', muted, large=22)
-node((578, 269, 963, 343), 'GET /p/{id}', 'Форма с вопросом из памяти', cold, '#edf5fc', large=24, small=19)
-node((578, 361, 963, 435), 'POST /api/polls/{id}/votes', 'Проверка и запись бюллетеня', hot, '#fff3e1', large=23, small=19)
-database((1090, 355, 1401, 441), 'PostgreSQL', 'пишущие шарды 1 … N', hot, '#fff3e1', 24, 19)
-database((1090, 227, 1401, 304), 'Реплика каждого шарда', 'в другой зоне доступности', hot, '#fffbf4', 20, 17)
-label(1025, 376, 'INSERT', 17, hot, True, 'mm')
-label(1025, 419, 'по хешу', 17, hot, False, 'mm')
-label(1244, 328, 'синхронная репликация', 17, hot, False, 'rm')
-label(786, 477, 'параметры и карта шардов до эфира', 17, cold)
+node((62, 280, 205, 361), "Зритель", "браузер", cold)
+node((253, 280, 459, 361), "Балансировщик", "HTTPS", muted, large=22)
+node((546, 255, 921, 325), "GET /p/{id}", "Форма опроса из памяти", cold, "#edf5fc")
+node((546, 342, 921, 413), "POST /api/polls/{id}/votes",
+     "202 после подтверждения Kafka", hot, "#fff3e1", large=22)
+label(1007, 357, "событие", 17, hot, True, "mm")
+label(1007, 399, "ключ зрителя", 17, hot, False, "mm")
 
-arrow([(251, 696), (344, 696)], cold)
-arrow([(610, 696), (680, 696)], cold, twoway=True)
-arrow([(1401, 398), (1442, 398), (1442, 696), (1383, 696)], tally)
-arrow([(1050, 696), (935, 696)], tally)
-label(991, 675, 'итог', 17, tally, True, 'mm')
-label(1428, 632, 'итоги шардов', 17, tally, False, 'rm')
+rectangle((1092, 285, 1418, 416), "#fff3e1", hot, 12)
+label(1255, 311, "Apache Kafka", 26, ink, True, "mm")
+label(1255, 347, "Партиции журнала голосов", 19, muted, False, "mm")
+label(1255, 383, "RF = 3   ·   min ISR = 2", 18, hot, False, "mm")
 
-node((66, 657, 251, 735), 'Редактор', 'админка', cold)
-node((344, 658, 610, 734), 'Admin API', 'создание и результаты', cold)
-database((680, 651, 935, 741), 'PostgreSQL', 'опросы и итоги', cold, '#ffffff', 22, 18)
-node((1050, 656, 1383, 736), 'Агрегатор', 'ожидает все шарды', tally, '#ffffff', 24, 19)
+# Publish once before the broadcast; read bounded input only after it ends.
+arrow([(467, 644), (467, 608), (725, 608), (725, 424)], cold, 2, True)
+label(741, 452, "версия опроса до эфира", 16, cold)
+arrow([(1418, 349), (1443, 349), (1443, 672), (1401, 672)], tally)
+
+# Both types of aggregate are written to the same PostgreSQL store.
+arrow([(227, 684), (294, 684)], cold)
+arrow([(510, 684), (572, 684)], cold, twoway=True)
+arrow([(963, 684), (853, 684)], tally)
+label(908, 664, "итоги", 17, tally, True, "mm")
+
+node((64, 644, 227, 725), "Редактор", "админка", cold)
+node((294, 644, 510, 725), "Admin API", "опрос и отчёт", cold)
+database((572, 626, 853, 741), "PostgreSQL", "опросы и агрегаты", cold, large=23, small=18)
+
+rectangle((963, 597, 1401, 754), "#ffffff", tally, 13)
+label(1182, 620, "Обработчики на Go", 23, ink, True, "mm")
+label(1182, 650, "Чтение заданных диапазонов партиций", 18, muted, False, "mm")
+label(1182, 678, "Первый голос по ключу зрителя", 18, muted, False, "mm")
+draw.line([(982 * SCALE, 701 * SCALE), (1381 * SCALE, 701 * SCALE)],
+          fill="#bdded6", width=2 * SCALE)
+label(1182, 727, "Итог по каждой партиции и общий итог", 18, tally, False, "mm")
 
 output = Path(__file__).resolve().parents[1] / "architecture.png"
 canvas.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS).save(output, optimize=True)
