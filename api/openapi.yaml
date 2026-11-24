@@ -1,0 +1,105 @@
+openapi: 3.1.1
+info:
+  title: Televote
+  version: 0.1.0
+paths:
+  /api/polls/{id}/votes:
+    post:
+      operationId: submitVote
+      summary: Анонимно отправить бюллетень
+      description: |
+        Время приёма полного запроса фиксирует сервер. При повторной отправке
+        браузер использует тот же токен. При подсчёте учитывается первый
+        допустимый бюллетень с этим токеном в данном опросе.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Идентификатор конкретного опроса.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, choices]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[0-9a-fA-F]{32}$'
+                  minLength: 32
+                  maxLength: 32
+                  description: Случайная 128-битная метка браузера для этого опроса.
+                choices:
+                  type: array
+                  minItems: 1
+                  uniqueItems: true
+                  items:
+                    type: integer
+                  description: Идентификаторы вариантов. Допустимые значения и количество задаёт опрос.
+            example:
+              token: '7ae145ffec3648e0b8c637d601cc4682'
+              choices: [2]
+      responses:
+        '202':
+          description: Kafka подтвердила запись заявки. Дедупликация и подсчёт выполняются после эфира.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: accepted
+              example: {status: accepted}
+        '400':
+          description: Некорректный JSON или формат идентификатора опроса.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: bad_request}
+        '404':
+          description: Опрос с таким идентификатором не найден.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: poll_not_found}
+        '409':
+          description: Опрос ещё не открыт.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: not_open}
+        '410':
+          description: На момент приёма этого запроса опрос уже закрыт.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: closed}
+        '422':
+          description: Тело запроса нарушает схему или правила бюллетеня для этого опроса.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: invalid_ballot}
+        '503':
+          description: |
+            Временная перегрузка или ошибка публикации. При тайм-ауте запись
+            могла состояться. Пока опрос открыт, допустим повтор с прежним токеном и выбором.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: unavailable}
+components:
+  schemas:
+    Error:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
