@@ -81,6 +81,12 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
               example: {code: closed}
+        '413':
+          description: Тело запроса превышает 1 МиБ.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: payload_too_large}
         '422':
           description: Тело запроса нарушает схему или правила бюллетеня для этого опроса.
           content:
