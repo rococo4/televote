@@ -18,7 +18,7 @@ import (
 func TestCountVotesOnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	f := newPollFixture(t, ctx, 5*time.Second, 2, []string{"A", "B", "C"})
+	f := newPollFixture(t, ctx, 5*time.Second, testCloseGrace, 2, []string{"A", "B", "C"})
 	// Start the same scheduler that runs alongside the HTTP server in cmd/televote.
 	done := make(chan struct{})
 	go func() {

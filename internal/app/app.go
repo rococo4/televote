@@ -32,8 +32,9 @@ type VoteJournal interface {
 }
 
 type localPoll struct {
-	poll   entity.Poll
-	joined bool
+	poll          entity.Poll
+	joined        bool
+	drainDeadline time.Time
 }
 
 type Handler struct {
@@ -46,7 +47,7 @@ type Handler struct {
 	journal  VoteJournal
 }
 
-func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal) (*Handler, error) {
+func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, closeGrace time.Duration) (*Handler, error) {
 	polls, err := pollsrepo.New(pool).LoadPublished(ctx)
 	if err != nil {
 		return nil, err
@@ -59,30 +60,34 @@ func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal) (
 	h := &Handler{
 		Handler: votes.NewHandler(service), voting: service, counting: counter,
 		polls: make(map[uuid.UUID]localPoll, len(polls)), writerID: uuid.New(),
-		closures: closurerepo.New(pool), journal: producer,
+		closures: closurerepo.New(pool, closeGrace), journal: producer,
 	}
 	for _, p := range polls {
-		var joined bool
+		local := localPoll{poll: p}
 		if time.Now().Before(p.ClosesAt) {
 			if err := counter.Prepare(ctx, p); err != nil {
 				return nil, fmt.Errorf("prepare counting for poll %s: %w", p.ID, err)
 			}
-			joined, err = h.closures.Join(ctx, p, h.writerID)
+			local.joined, local.drainDeadline, err = h.closures.Join(ctx, p, h.writerID)
 			if err != nil {
 				return nil, err
 			}
 		}
-		if !joined {
+		if !local.joined {
 			if _, err := service.Seal(p.ID); err != nil {
 				return nil, err
 			}
 		}
-		h.polls[p.ID] = localPoll{poll: p, joined: joined}
+		h.polls[p.ID] = local
 	}
 	return h, nil
 }
 
 func Run(ctx context.Context) error {
+	closeGrace, err := configuredCloseGrace()
+	if err != nil {
+		return err
+	}
 	startup, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(startup, setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
@@ -99,7 +104,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer producer.Close()
-	handler, err := NewHandler(startup, pool, producer)
+	handler, err := NewHandler(startup, pool, producer, closeGrace)
 	if err != nil {
 		return err
 	}
@@ -153,4 +158,17 @@ func setting(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func configuredCloseGrace() (time.Duration, error) {
+	const name = "POLL_CLOSE_GRACE_PERIOD"
+	value := setting(name, "5s")
+	grace, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q: %w", name, value, err)
+	}
+	if grace < 0 || grace%time.Microsecond != 0 {
+		return 0, fmt.Errorf("%s=%q: expected a nonnegative duration in whole microseconds", name, value)
+	}
+	return grace, nil
 }

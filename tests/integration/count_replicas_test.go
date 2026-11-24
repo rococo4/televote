@@ -33,7 +33,10 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			f := newVoteFixture(t, ctx, 3*time.Second)
+			// The first writer fixes the grace period for this generation.
+			// A differently configured replica must use the same PG cutoff.
+			const pollGrace = 2 * time.Second
+			f := newPollFixture(t, ctx, 3*time.Second, pollGrace, 1, []string{"A", "B"})
 			p := f.poll
 			writer, err := kafka.New(f.brokers)
 			if err != nil {
@@ -41,7 +44,7 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 			}
 			t.Cleanup(writer.Close)
 			gate := &delayedJournal{Producer: writer, ctx: ctx, admitted: make(chan struct{}), release: make(chan struct{}), delivered: make(chan struct{})}
-			second, err := app.NewHandler(ctx, f.pool, gate)
+			second, err := app.NewHandler(ctx, f.pool, gate, 12*time.Second)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,31 +97,38 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 			waitPG(ctx, t, f, `SELECT EXISTS (SELECT 1 FROM poll_results WHERE poll_id=$1)`)
 			var reason string
 			var decidedAt, closesAt time.Time
-			if err := f.pool.QueryRow(ctx, `SELECT decision_reason, decided_at, closes_at
-				FROM poll_closures WHERE poll_id=$1 AND version=$2`, p.ID, p.Version).Scan(&reason, &decidedAt, &closesAt); err != nil {
+			var graceMicros int64
+			if err := f.pool.QueryRow(ctx, `SELECT decision_reason, decided_at, closes_at, grace_us
+				FROM poll_closures WHERE poll_id=$1 AND version=$2`, p.ID, p.Version).Scan(&reason, &decidedAt, &closesAt, &graceMicros); err != nil {
 				t.Fatal(err)
 			}
+			if graceMicros != pollGrace.Microseconds() {
+				t.Fatalf("stored grace is %d µs; first writer configured %s", graceMicros, pollGrace)
+			}
 			delay := decidedAt.Sub(closesAt) // Both timestamps came from PostgreSQL.
-			if reason != tc.reason || delay < 0 || (delay >= 5*time.Second) != (tc.reason == "timeout") {
+			if reason != tc.reason || delay < 0 || (delay >= pollGrace) != (tc.reason == "timeout") {
 				t.Fatalf("decision=%s delay=%s; want %s", reason, delay, tc.reason)
 			}
+			if tc.reason == "timeout" && delay >= pollGrace+2*time.Second {
+				t.Fatalf("timeout took %s; expected %s grace plus scheduler overhead", delay, pollGrace)
+			}
+			select {
+			case code := <-status:
+				if code != tc.status {
+					t.Fatalf("second HTTP status %d, want %d", code, tc.status)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 			if tc.reason == "timeout" {
-				// Kafka may append a timed-out send. Releasing it only after FINAL
-				// forces the ambiguous record strictly after the first CLOSE.
+				// The 503 and the stored final are both known. Only now let
+				// Kafka append the ambiguous record, after the first CLOSE.
 				close(gate.release)
 			}
 			select {
 			case <-gate.delivered:
 				if gate.err != nil {
 					t.Fatal(gate.err)
-				}
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			}
-			select {
-			case code := <-status:
-				if code != tc.status {
-					t.Fatalf("second HTTP status %d, want %d", code, tc.status)
 				}
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())

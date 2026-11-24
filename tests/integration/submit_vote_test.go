@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	partitions  = 4
-	pollVersion = 7
-	defaultDB   = "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"
+	partitions     = 4
+	pollVersion    = 7
+	defaultDB      = "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"
+	testCloseGrace = 5 * time.Second
 )
 
 func TestSubmitVoteWritesToKafka(t *testing.T) {
@@ -121,10 +122,10 @@ type voteFixture struct {
 
 func newVoteFixture(t *testing.T, ctx context.Context, openFor time.Duration) *voteFixture {
 	t.Helper()
-	return newPollFixture(t, ctx, openFor, 1, []string{"A", "B"})
+	return newPollFixture(t, ctx, openFor, testCloseGrace, 1, []string{"A", "B"})
 }
 
-func newPollFixture(t *testing.T, ctx context.Context, openFor time.Duration, maxChoices int, labels []string) *voteFixture {
+func newPollFixture(t *testing.T, ctx context.Context, openFor, closeGrace time.Duration, maxChoices int, labels []string) *voteFixture {
 	t.Helper()
 	pool := newTestDatabase(t, ctx)
 	id := uuid.New()
@@ -155,7 +156,7 @@ func newPollFixture(t *testing.T, ctx context.Context, openFor time.Duration, ma
 		t.Fatal(err)
 	}
 	t.Cleanup(writer.Close)
-	handler, err := app.NewHandler(ctx, pool, writer)
+	handler, err := app.NewHandler(ctx, pool, writer, closeGrace)
 	if err != nil {
 		t.Fatal(err)
 	}

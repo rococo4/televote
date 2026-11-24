@@ -12,26 +12,36 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-const GracePeriod = 5 * time.Second
-
 type Repository struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	grace time.Duration
 }
 
-func New(pool *pgxpool.Pool) *Repository { return &Repository{pool: pool} }
+func New(pool *pgxpool.Pool, grace time.Duration) *Repository {
+	return &Repository{pool: pool, grace: grace}
+}
+
+type generation struct {
+	closesAt, cutoff time.Time
+	frozen, decided  bool
+}
 
 // Join must commit before the process admits its first vote for this generation.
-func (r *Repository) Join(ctx context.Context, p entity.Poll, writer uuid.UUID) (bool, error) {
+// The returned cutoff is shared by all writers regardless of their local config.
+func (r *Repository) Join(ctx context.Context, p entity.Poll, writer uuid.UUID) (bool, time.Time, error) {
 	if writer == uuid.Nil {
-		return false, errors.New("empty writer ID")
+		return false, time.Time{}, errors.New("empty writer ID")
 	}
-	return r.withGeneration(ctx, p, func(tx pgx.Tx) (bool, error) {
+	return r.withGeneration(ctx, p, func(tx pgx.Tx, g generation) (bool, error) {
+		if g.frozen {
+			return false, nil
+		}
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO poll_writers AS w (poll_id, version, writer_id)
 			SELECT c.poll_id, c.version, $3
 			FROM poll_closures c JOIN polls p ON (p.id, p.version) = (c.poll_id, c.version)
 			WHERE c.poll_id = $1 AND c.version = $2 AND p.published
-			  AND NOT c.frozen AND clock_timestamp() < c.closes_at
+			  AND clock_timestamp() < c.closes_at
 			ON CONFLICT (poll_id, version, writer_id) DO UPDATE SET writer_id = w.writer_id
 			    WHERE w.drained_at IS NULL`, p.ID, p.Version, writer)
 		if err != nil {
@@ -65,26 +75,20 @@ func (r *Repository) Drain(ctx context.Context, p entity.Poll, writer uuid.UUID)
 // Decide freezes the roster at the deadline. Once eligible for markers a
 // generation stays eligible, including after a Kafka error or a process restart.
 func (r *Repository) Decide(ctx context.Context, p entity.Poll) (bool, error) {
-	return r.withGeneration(ctx, p, func(tx pgx.Tx) (bool, error) {
-		var closesAt, now time.Time
-		var frozen, decided bool
-		err := tx.QueryRow(ctx, `
-			SELECT closes_at, clock_timestamp(), frozen, decided_at IS NOT NULL
-			FROM poll_closures WHERE poll_id = $1 AND version = $2`, p.ID, p.Version).
-			Scan(&closesAt, &now, &frozen, &decided)
-		if err != nil || decided || now.Before(closesAt) {
-			return decided, err
+	ready, _, err := r.withGeneration(ctx, p, func(tx pgx.Tx, g generation) (bool, error) {
+		if g.decided {
+			return true, nil
 		}
 
+		var now time.Time
 		var drainedInTime bool
-		cutoff := closesAt.Add(GracePeriod)
-		err = tx.QueryRow(ctx, `
-			SELECT count(*) > 0 AND count(*) FILTER (
+		err := tx.QueryRow(ctx, `
+			SELECT clock_timestamp(), count(*) > 0 AND count(*) FILTER (
 			    WHERE drained_at IS NULL OR drained_at > $3
 			) = 0
-			FROM poll_writers WHERE poll_id = $1 AND version = $2`, p.ID, p.Version, cutoff).
-			Scan(&drainedInTime)
-		if err != nil {
+			FROM poll_writers WHERE poll_id = $1 AND version = $2`, p.ID, p.Version, g.cutoff).
+			Scan(&now, &drainedInTime)
+		if err != nil || now.Before(g.closesAt) {
 			return false, err
 		}
 
@@ -92,10 +96,10 @@ func (r *Repository) Decide(ctx context.Context, p entity.Poll) (bool, error) {
 		switch {
 		case drainedInTime:
 			reason = "drained"
-		case !now.Before(cutoff):
+		case !now.Before(g.cutoff):
 			reason = "timeout"
 		default:
-			if !frozen {
+			if !g.frozen {
 				_, err = tx.Exec(ctx, `UPDATE poll_closures SET frozen = true
 					WHERE poll_id = $1 AND version = $2`, p.ID, p.Version)
 			}
@@ -106,33 +110,38 @@ func (r *Repository) Decide(ctx context.Context, p entity.Poll) (bool, error) {
 			WHERE poll_id = $1 AND version = $2`, p.ID, p.Version, reason, now)
 		return true, err
 	})
+	return ready, err
 }
 
 // Every join and decision locks the same generation row first. At READ COMMITTED
 // the following statement sees writers that committed while acquiring the lock.
-func (r *Repository) withGeneration(ctx context.Context, p entity.Poll, action func(pgx.Tx) (bool, error)) (bool, error) {
+func (r *Repository) withGeneration(ctx context.Context, p entity.Poll, action func(pgx.Tx, generation) (bool, error)) (bool, time.Time, error) {
 	var result bool
+	var g generation
 	err := pgx.BeginTxFunc(ctx, r.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO poll_closures (poll_id, version, closes_at)
-			SELECT id, version, closes_at FROM polls WHERE id = $1 AND version = $2 AND published
-			ON CONFLICT (poll_id, version) DO NOTHING`, p.ID, p.Version)
+			INSERT INTO poll_closures (poll_id, version, closes_at, grace_us)
+			SELECT id, version, closes_at, $3 FROM polls WHERE id = $1 AND version = $2 AND published
+			ON CONFLICT (poll_id, version) DO NOTHING`, p.ID, p.Version, r.grace.Microseconds())
 		if err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `SELECT poll_id FROM poll_closures
-			WHERE poll_id = $1 AND version = $2 FOR UPDATE`, p.ID, p.Version)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
+		var graceUs int64
+		err = tx.QueryRow(ctx, `SELECT closes_at, grace_us, frozen, decided_at IS NOT NULL
+			FROM poll_closures WHERE poll_id = $1 AND version = $2 FOR UPDATE`, p.ID, p.Version).
+			Scan(&g.closesAt, &graceUs, &g.frozen, &g.decided)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return errors.New("unknown published poll generation")
 		}
-		result, err = action(tx)
+		if err != nil {
+			return err
+		}
+		g.cutoff = g.closesAt.Add(time.Duration(graceUs) * time.Microsecond)
+		result, err = action(tx, g)
 		return err
 	})
 	if err != nil {
-		return false, fmt.Errorf("coordinate close for poll %s version %d: %w", p.ID, p.Version, err)
+		return false, time.Time{}, fmt.Errorf("coordinate close for poll %s version %d: %w", p.ID, p.Version, err)
 	}
-	return result, nil
+	return result, g.cutoff, nil
 }

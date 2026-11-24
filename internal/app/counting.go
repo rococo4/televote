@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rococo4/televote/internal/entity"
-	"github.com/rococo4/televote/internal/repository/closurerepo"
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
@@ -38,7 +37,7 @@ func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 	if local.joined {
-		if err := h.drainWriter(ctx, p, handlersDone); err != nil {
+		if err := h.drainWriter(ctx, local, handlersDone); err != nil {
 			return err
 		}
 	} else {
@@ -66,17 +65,17 @@ func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
 	}
 }
 
-func (h *Handler) drainWriter(ctx context.Context, p entity.Poll, handlersDone <-chan struct{}) error {
+func (h *Handler) drainWriter(ctx context.Context, local localPoll, handlersDone <-chan struct{}) error {
 	// Apply one absolute budget to both HTTP handlers and outstanding Kafka
 	// callbacks. A stuck send on the last surviving scheduler must not stall it.
-	drainCtx, cancel := context.WithDeadline(ctx, p.ClosesAt.Add(closurerepo.GracePeriod))
+	drainCtx, cancel := context.WithDeadline(ctx, local.drainDeadline)
 	defer cancel()
 	select {
 	case <-drainCtx.Done():
 		return ctx.Err()
 	case <-handlersDone:
 	}
-	err := h.journal.WaitVotes(drainCtx, p.ID)
+	err := h.journal.WaitVotes(drainCtx, local.poll.ID)
 	if drainCtx.Err() != nil {
 		// The grace deadline permits a timeout decision. Caller cancellation does not.
 		return ctx.Err()
@@ -84,7 +83,7 @@ func (h *Handler) drainWriter(ctx context.Context, p entity.Poll, handlersDone <
 	if err != nil {
 		return err
 	}
-	return h.closures.Drain(ctx, p, h.writerID)
+	return h.closures.Drain(ctx, local.poll, h.writerID)
 }
 
 func (h *Handler) finishPoll(ctx context.Context, p entity.Poll) {
