@@ -11,17 +11,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/rococo4/televote/internal/adapter/kafka"
 	"github.com/rococo4/televote/internal/api/http/votes"
+	"github.com/rococo4/televote/internal/entity"
 	"github.com/rococo4/televote/internal/repository/pollsrepo"
+	"github.com/rococo4/televote/internal/repository/resultsrepo"
+	"github.com/rococo4/televote/internal/service/counting"
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
 type Handler struct {
 	http.Handler
-	voting *voting.Service
+	voting   *voting.Service
+	counting *counting.Service
+	polls    []entity.Poll
 }
 
 func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Producer) (*Handler, error) {
@@ -33,7 +39,24 @@ func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer *kafka.Produce
 		return nil, fmt.Errorf("connect to Kafka: %w", err)
 	}
 	service := voting.New(polls, producer, time.Now)
-	return &Handler{Handler: votes.NewHandler(service), voting: service}, nil
+	counter := counting.New(producer, resultsrepo.New(pool))
+	for _, p := range polls {
+		if time.Now().Before(p.ClosesAt) {
+			if err := counter.Prepare(ctx, p); err != nil {
+				return nil, fmt.Errorf("prepare counting for poll %s: %w", p.ID, err)
+			}
+		}
+	}
+	return &Handler{Handler: votes.NewHandler(service), voting: service, counting: counter, polls: polls}, nil
+}
+
+// CountClosedPoll resumes a closed poll from its saved partition results.
+func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
+	p, err := h.voting.Seal(ctx, id)
+	if err != nil {
+		return err
+	}
+	return h.counting.Count(ctx, p)
 }
 
 func Run(ctx context.Context) error {
@@ -71,10 +94,17 @@ func Run(ctx context.Context) error {
 	log.Printf("televote listening on %s", listener.Addr())
 	stopped := make(chan error, 1)
 	go func() { stopped <- server.Serve(listener) }()
+	countCtx, cancelCounting := context.WithCancel(ctx)
+	countsDone := make(chan struct{})
+	go func() {
+		defer close(countsDone)
+		handler.RunCounting(countCtx)
+	}()
 	select {
 	case err = <-stopped:
 	case <-ctx.Done():
 	}
+	cancelCounting()
 	shutdown, stop := context.WithTimeout(context.Background(), 20*time.Second)
 	defer stop()
 	shutdownErr := server.Shutdown(shutdown)
@@ -82,6 +112,7 @@ func Run(ctx context.Context) error {
 		_ = server.Close()
 	}
 	handler.voting.Drain()
+	<-countsDone
 	return errors.Join(err, shutdownErr, producer.Flush(shutdown))
 }
 

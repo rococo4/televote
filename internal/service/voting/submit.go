@@ -21,20 +21,25 @@ var (
 )
 
 type Service struct {
-	polls     map[uuid.UUID]entity.Poll
+	polls     map[uuid.UUID]*pollIntake
 	publisher Publisher
 	now       func() time.Time
 
 	gate     sync.RWMutex
 	draining bool
+}
+
+type pollIntake struct {
+	poll     entity.Poll
 	inFlight sync.WaitGroup
+	sealed   chan struct{}
 }
 
 func New(polls []entity.Poll, publisher Publisher, now func() time.Time) *Service {
-	snapshot := make(map[uuid.UUID]entity.Poll, len(polls))
+	snapshot := make(map[uuid.UUID]*pollIntake, len(polls))
 	for _, poll := range polls {
 		poll.Choices = maps.Clone(poll.Choices)
-		snapshot[poll.ID] = poll
+		snapshot[poll.ID] = &pollIntake{poll: poll}
 	}
 	return &Service{polls: snapshot, publisher: publisher, now: now}
 }

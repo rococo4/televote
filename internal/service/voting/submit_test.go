@@ -56,6 +56,15 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 	if _, err := s.Begin(p.ID); !errors.Is(err, entity.ErrClosed) {
 		t.Fatalf("late admission: got %v", err)
 	}
+	// The cancelled wait can return immediately, but sealing cannot report
+	// success while the already admitted vote is still waiting for Kafka.
+	if _, err := s.Seal(ctx, p.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("seal with outstanding publication: got %v", err)
+	}
+	elapsed.Store(int64(59 * time.Second)) // A clock correction cannot reopen the sealed poll.
+	if _, err := s.Begin(p.ID); !errors.Is(err, entity.ErrClosed) {
+		t.Fatalf("admission after sealing: got %v", err)
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("publication returned before ACK: %v", err)
@@ -64,6 +73,10 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 	close(ack)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+	sealed, err := s.Seal(context.Background(), p.ID)
+	if err != nil || sealed.ID != p.ID {
+		t.Fatalf("seal after delivery: poll %s, err %v", sealed.ID, err)
 	}
 	s.Drain()
 	if _, err := s.Begin(p.ID); !errors.Is(err, ErrUnavailable) {

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,7 +17,9 @@ import (
 )
 
 type Producer struct {
-	client *kgo.Client
+	client     *kgo.Client
+	brokers    []string
+	deliveries sync.Map // poll UUID -> *sync.WaitGroup for Kafka delivery callbacks
 }
 
 func New(brokers []string) (*Producer, error) {
@@ -34,7 +38,7 @@ func New(brokers []string) (*Producer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create Kafka producer: %w", err)
 	}
-	return &Producer{client: client}, nil
+	return &Producer{client: client, brokers: slices.Clone(brokers)}, nil
 }
 
 func (p *Producer) Ping(ctx context.Context) error {
@@ -49,41 +53,80 @@ func (p *Producer) Close() {
 	p.client.Close()
 }
 
-type voteValue struct {
-	PollID     uuid.UUID `json:"poll_id"`
-	Version    int64     `json:"version"`
+type eventHeader struct {
+	Type    string    `json:"type,omitempty"`
+	PollID  uuid.UUID `json:"poll_id"`
+	Version int64     `json:"version"`
+}
+
+// The reader uses *int choices to distinguish JSON null from choice ID 0.
+type voteValue[T int | *int] struct {
+	eventHeader
 	ReceivedAt time.Time `json:"received_at"`
-	Choices    []int     `json:"choices"`
+	Choices    []T       `json:"choices"`
 }
 
 func (p *Producer) Publish(ctx context.Context, poll entity.Poll, vote entity.VoteSubmitted) error {
 	if poll.Partitions < 1 {
 		return fmt.Errorf("invalid partition count %d for poll %s", poll.Partitions, poll.ID)
 	}
-	value, err := json.Marshal(voteValue{
-		PollID:     vote.PollID,
-		Version:    vote.Version,
-		ReceivedAt: vote.ReceivedAt,
-		Choices:    vote.Choices,
+	value, err := json.Marshal(voteValue[int]{
+		eventHeader: eventHeader{PollID: vote.PollID, Version: vote.Version},
+		ReceivedAt:  vote.ReceivedAt,
+		Choices:     vote.Choices,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal vote: %w", err)
 	}
 
-	partition := binary.BigEndian.Uint64(vote.VoterKey[:8]) % uint64(poll.Partitions)
+	partition := voterPartition(vote.VoterKey, poll.Partitions)
 	record := &kgo.Record{
 		Topic:     poll.Topic,
-		Partition: int32(partition),
+		Partition: partition,
 		Key:       vote.VoterKey[:],
 		Value:     value,
 	}
 	result := make(chan error, 1)
-	p.client.TryProduce(ctx, record, func(_ *kgo.Record, err error) { result <- err })
+	active, ok := p.deliveries.Load(poll.ID)
+	if !ok {
+		active, _ = p.deliveries.LoadOrStore(poll.ID, new(sync.WaitGroup))
+	}
+	pending := active.(*sync.WaitGroup)
+	pending.Add(1)
+	p.client.TryProduce(ctx, record, func(_ *kgo.Record, err error) {
+		result <- err
+		pending.Done()
+	})
 	select {
 	case err := <-result:
 		return err
 	case <-ctx.Done():
 		// A late ACK is still possible. Flush waits for outstanding sends on shutdown.
+		return ctx.Err()
+	}
+}
+
+func voterPartition(key [32]byte, partitions int) int32 {
+	return int32(binary.BigEndian.Uint64(key[:8]) % uint64(partitions))
+}
+
+// WaitVotes is called after admission for this poll is sealed and its
+// handlers have finished. An HTTP timeout may precede the delivery callback.
+func (p *Producer) WaitVotes(ctx context.Context, pollID uuid.UUID) error {
+	active, ok := p.deliveries.Load(pollID)
+	if !ok {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		active.(*sync.WaitGroup).Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		p.deliveries.Delete(pollID)
+		return nil
+	case <-ctx.Done():
 		return ctx.Err()
 	}
 }

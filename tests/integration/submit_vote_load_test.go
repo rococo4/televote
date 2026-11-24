@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -28,9 +29,23 @@ type voteSample struct {
 }
 
 func TestSubmitVoteLoad(t *testing.T) {
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	id, topic, reader, server := newVoteFixture(t, ctx)
+	// Reserve ten seconds beyond the one-minute input profile for local timer jitter.
+	f := newVoteFixture(t, ctx, 70*time.Second)
+	countDone := make(chan struct{})
+	var finalized time.Time
+	go func() {
+		f.handler.RunCounting(ctx)
+		finalized = time.Now()
+		close(countDone)
+	}()
+	defer func() {
+		cancel()
+		<-countDone
+	}()
+	id, topic, reader, server := f.poll.ID, f.poll.Topic, f.reader, f.server
 	path := server.URL + "/api/polls/" + id.String() + "/votes"
 	const maxInflight = 128
 	transport := server.Client().Transport.(*http.Transport).Clone()
@@ -43,9 +58,13 @@ func TestSubmitVoteLoad(t *testing.T) {
 	const total = 2 * perPhase
 	bodies := make([]string, total)
 	keys := make([]string, total)
+	wantCounts := make(map[int]int64)
 	for i := range bodies {
 		// Within each complete group of eleven POSTs, repeat the tenth voter.
 		voter := i/11*10 + min(i%11, 9)
+		if i%11 != 10 {
+			wantCounts[voter%2+1]++
+		}
 		var token [16]byte
 		binary.BigEndian.PutUint64(token[8:], uint64(voter+1))
 		bodies[i] = fmt.Sprintf(`{"token":"%x","choices":[%d]}`, token, voter%2+1)
@@ -89,6 +108,26 @@ func TestSubmitVoteLoad(t *testing.T) {
 	for phase, duration := range durations {
 		reportVotePhase(t, samples[phase*perPhase:(phase+1)*perPhase], phaseStarts[phase], duration)
 	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for final result")
+	case <-countDone:
+	}
+	var ballots int64
+	var counts map[int]int64
+	err := f.pool.QueryRow(ctx, `SELECT ballots, counts FROM poll_results
+		WHERE poll_id = $1 AND version = $2 AND algorithm = 1`, id, f.poll.Version).Scan(&ballots, &counts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ballots != wantCounts[1]+wantCounts[2] || !maps.Equal(counts, wantCounts) {
+		t.Errorf("final: %d ballots, counts %v; expected %v", ballots, counts, wantCounts)
+	}
+	finalDelay := finalized.Sub(f.poll.ClosesAt)
+	if finalDelay < 0 || finalDelay > time.Since(started) {
+		t.Fatalf("inconsistent finalization interval %s", finalDelay)
+	}
+	t.Logf("PostgreSQL: %d ballots, A=%d B=%d, elapsed since poll deadline %s", ballots, counts[1], counts[2], finalDelay)
 	readCtx, stop := context.WithTimeout(ctx, 20*time.Second)
 	defer stop()
 	gotKeys := readLoadVoteKeys(t, readCtx, reader, topic)
@@ -215,16 +254,25 @@ func readLoadVoteKeys(t *testing.T, ctx context.Context, reader *kgo.Client, top
 	reader.AddConsumeTopics(topic)
 	keys := make(map[string]int)
 	var count int64
+	var markers int64
 	for count < total {
 		batch := reader.PollFetches(ctx)
 		if errs := batch.Errors(); len(errs) != 0 {
 			t.Fatalf("consume load records: %v", errs)
 		}
 		batch.EachRecord(func(r *kgo.Record) {
-			keys[string(r.Key)]++
 			count++
+			if r.Key == nil {
+				var event struct{ Type string }
+				if json.Unmarshal(r.Value, &event) != nil || event.Type != "CLOSE" {
+					t.Fatalf("unexpected unkeyed event at %d/%d", r.Partition, r.Offset)
+				}
+				markers++
+				return
+			}
+			keys[string(r.Key)]++
 		})
 	}
-	t.Logf("Kafka: %d records across %d partitions, %d distinct voter keys", count, partitions, len(keys))
+	t.Logf("Kafka: %d votes and %d close markers across %d partitions, %d distinct voter keys", count-markers, markers, partitions, len(keys))
 	return keys
 }

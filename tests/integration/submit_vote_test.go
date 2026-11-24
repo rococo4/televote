@@ -9,16 +9,17 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -26,18 +27,21 @@ import (
 
 	"github.com/rococo4/televote/internal/adapter/kafka"
 	"github.com/rococo4/televote/internal/app"
+	"github.com/rococo4/televote/internal/entity"
 )
 
 const (
 	partitions  = 4
 	pollVersion = 7
+	defaultDB   = "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"
 )
 
 func TestSubmitVoteWritesToKafka(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	id, topic, reader, server := newVoteFixture(t, ctx)
+	f := newVoteFixture(t, ctx, time.Hour)
+	id, topic, reader, server := f.poll.ID, f.poll.Topic, f.reader, f.server
 
 	// Pick a nonzero partition so a producer which always writes to 0 fails every run.
 	var token uuid.UUID
@@ -105,14 +109,24 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 	t.Logf("2 HTTP 202 responses; consumed 2 votes in %s[%d], offsets %d and %d", topic, wantPartition, records[0].Offset, records[1].Offset)
 }
 
-func newVoteFixture(t *testing.T, ctx context.Context) (uuid.UUID, string, *kgo.Client, *httptest.Server) {
-	t.Helper()
-	pool, err := pgxpool.New(ctx, setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+type voteFixture struct {
+	poll    entity.Poll
+	reader  *kgo.Client
+	server  *httptest.Server
+	pool    *pgxpool.Pool
+	handler *app.Handler
+	writer  *kafka.Producer
+	brokers []string
+}
 
+func newVoteFixture(t *testing.T, ctx context.Context, openFor time.Duration) *voteFixture {
+	t.Helper()
+	return newPollFixture(t, ctx, openFor, 1, []string{"A", "B"})
+}
+
+func newPollFixture(t *testing.T, ctx context.Context, openFor time.Duration, maxChoices int, labels []string) *voteFixture {
+	t.Helper()
+	pool := newTestDatabase(t, ctx)
 	id := uuid.New()
 	topic := "televote-it-" + id.String()
 	brokers := strings.Split(setting("KAFKA_BROKERS", "127.0.0.1:59092"), ",")
@@ -122,7 +136,19 @@ func newVoteFixture(t *testing.T, ctx context.Context) (uuid.UUID, string, *kgo.
 	}
 	t.Cleanup(reader.Close)
 	createTopic(t, ctx, reader, topic)
-	insertOpenPoll(t, ctx, pool, id, topic)
+	// PostgreSQL stores whole microseconds. Round down with Add so the local
+	// deadline also retains Go's monotonic clock for measuring finalization.
+	now := time.Now()
+	now = now.Add(-time.Duration(now.Nanosecond() % 1000))
+	poll := entity.Poll{
+		ID: id, Version: pollVersion, OpensAt: now.Add(-time.Hour), ClosesAt: now.Add(openFor),
+		MinChoices: 1, MaxChoices: maxChoices, Choices: make(map[int]struct{}, len(labels)),
+		Topic: topic, Partitions: partitions,
+	}
+	for i := range labels {
+		poll.Choices[i+1] = struct{}{}
+	}
+	insertOpenPoll(t, ctx, pool, poll, labels)
 
 	writer, err := kafka.New(brokers)
 	if err != nil {
@@ -136,31 +162,28 @@ func newVoteFixture(t *testing.T, ctx context.Context) (uuid.UUID, string, *kgo.
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	return id, topic, reader, server
+	return &voteFixture{
+		poll: poll, reader: reader, server: server, pool: pool, handler: handler,
+		writer: writer, brokers: brokers,
+	}
 }
 
-func insertOpenPoll(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, topic string) {
+func insertOpenPoll(t *testing.T, ctx context.Context, pool *pgxpool.Pool, poll entity.Poll, labels []string) {
 	t.Helper()
 	// Keep the poll and its options visible as one fixture to the startup query.
 	_, err := pool.Exec(ctx, `
 		WITH added AS (
 			INSERT INTO polls (id, version, question, opens_at, closes_at, min_choices, max_choices, topic, partitions, published)
-			VALUES ($1, $2, 'A or B?', now() - interval '1 hour', now() + interval '1 hour', 1, 1, $3, $4, true)
+			VALUES ($1, $2, 'Choose an answer', $3, $4, 1, $5, $6, $7, true)
 			RETURNING id
 		)
 		INSERT INTO poll_choices (poll_id, id, label)
 		SELECT added.id, choice.id, choice.label FROM added
-		CROSS JOIN (VALUES (1, 'A'), (2, 'B')) AS choice(id, label)`, id, pollVersion, topic, partitions)
+		CROSS JOIN unnest($8::text[]) WITH ORDINALITY AS choice(label, id)`,
+		poll.ID, poll.Version, poll.OpensAt, poll.ClosesAt, poll.MaxChoices, poll.Topic, poll.Partitions, labels)
 	if err != nil {
 		t.Fatalf("insert poll into migrated PostgreSQL: %v", err)
 	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := pool.Exec(ctx, "DELETE FROM polls WHERE id = $1", id); err != nil {
-			t.Errorf("remove test poll: %v", err)
-		}
-	})
 }
 
 func createTopic(t *testing.T, ctx context.Context, client *kgo.Client, topic string) {
@@ -191,10 +214,21 @@ func createTopic(t *testing.T, ctx context.Context, client *kgo.Client, topic st
 	})
 }
 
-func postVote(t *testing.T, ctx context.Context, client *http.Client, path, token string, choice int) {
+func postVote(t *testing.T, ctx context.Context, client *http.Client, path, token string, choices ...int) {
 	t.Helper()
-	body := fmt.Sprintf(`{"token":"%s","choices":[%d]}`, token, choice)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, strings.NewReader(body))
+	status, reply := sendBallot(t, ctx, client, path, token, choices)
+	if status != http.StatusAccepted || reply["status"] != "accepted" {
+		t.Fatalf("POST returned HTTP %d, %v", status, reply)
+	}
+}
+
+func sendBallot(t *testing.T, ctx context.Context, client *http.Client, path, token string, choices []int) (int, map[string]string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"token": token, "choices": choices})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,9 +242,7 @@ func postVote(t *testing.T, ctx context.Context, client *http.Client, path, toke
 	if err := json.NewDecoder(res.Body).Decode(&reply); err != nil {
 		t.Fatalf("decode HTTP %d response: %v", res.StatusCode, err)
 	}
-	if res.StatusCode != http.StatusAccepted || reply["status"] != "accepted" {
-		t.Fatalf("POST returned HTTP %d, %v", res.StatusCode, reply)
-	}
+	return res.StatusCode, reply
 }
 
 func setting(name, fallback string) string {
@@ -218,4 +250,44 @@ func setting(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func newTestDatabase(t *testing.T, ctx context.Context) *pgxpool.Pool {
+	t.Helper()
+	// App startup binds every published poll. Isolate all tests from existing polls.
+	cfg, err := pgxpool.ParseConfig(setting("DATABASE_URL", defaultDB))
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := pgx.Identifier{"televote_count_" + uuid.NewString()}.Sanitize()
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := pool.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Errorf("remove isolated poll schema: %v", err)
+		}
+	})
+	files, err := filepath.Glob("../../internal/migrations/postgres/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("find migrations: %v (%v)", err, files)
+	}
+	for _, path := range files {
+		sql, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("apply %s: %v", path, err)
+		}
+	}
+	return pool
 }
