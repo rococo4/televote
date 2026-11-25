@@ -11,20 +11,21 @@ import (
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
-// RunCounting closes published polls at their deadlines and resumes closed polls.
-// It returns when all known results are final or the application is stopping.
+// RunCounting finishes a fixed snapshot. ServePolls is the long-running scheduler.
 func (h *Handler) RunCounting(ctx context.Context) {
 	var jobs sync.WaitGroup
+	h.mu.RLock()
 	for _, local := range h.polls {
 		jobs.Go(func() { h.finishPoll(ctx, local.poll) })
 	}
+	h.mu.RUnlock()
 	jobs.Wait()
 }
 
 // CountClosedPoll may be called concurrently on multiple replicas. Every
 // replica must observe the same durable decision before appending a marker.
 func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
-	local, ok := h.polls[id]
+	local, ok := h.lookup(id)
 	if !ok {
 		return voting.ErrPollNotFound
 	}

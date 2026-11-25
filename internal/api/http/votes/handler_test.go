@@ -66,7 +66,7 @@ func TestPOST(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/polls/"+tc.pollID+"/votes", strings.NewReader(tc.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
-			NewHandler(s).ServeHTTP(w, req)
+			NewHandler(s, nil).ServeHTTP(w, req)
 			if w.Code != tc.status || w.Header().Get("Content-Type") != "application/json" {
 				t.Fatalf("got %d %v: %s", w.Code, w.Header(), w.Body.String())
 			}

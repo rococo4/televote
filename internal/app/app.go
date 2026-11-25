@@ -5,26 +5,38 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/rococo4/televote/internal/adapter/kafka"
+	"github.com/rococo4/televote/internal/api/http/adminpolls"
 	"github.com/rococo4/televote/internal/api/http/votes"
 	"github.com/rococo4/televote/internal/entity"
 	"github.com/rococo4/televote/internal/repository/closurerepo"
 	"github.com/rococo4/televote/internal/repository/pollsrepo"
 	"github.com/rococo4/televote/internal/repository/resultsrepo"
 	"github.com/rococo4/televote/internal/service/counting"
+	"github.com/rococo4/televote/internal/service/polls"
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
+type AdminConfig struct {
+	Token      string
+	Partitions int
+}
+
 type VoteJournal interface {
+	EnsureTopic(context.Context, entity.Poll) (uuid.UUID, error)
 	voting.Publisher
 	counting.Journal
 	Ping(context.Context) error
@@ -41,45 +53,41 @@ type Handler struct {
 	http.Handler
 	voting   *voting.Service
 	counting *counting.Service
+	mu       sync.RWMutex
 	polls    map[uuid.UUID]localPoll
+	startJob func(entity.Poll)
+	loading  singleflight.Group
+	source   *pollsrepo.Repository
 	writerID uuid.UUID
 	closures *closurerepo.Repository
 	journal  VoteJournal
 }
 
-func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, closeGrace time.Duration) (*Handler, error) {
-	polls, err := pollsrepo.New(pool).LoadPublished(ctx)
+func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, closeGrace time.Duration, admin AdminConfig) (*Handler, error) {
+	source := pollsrepo.New(pool)
+	published, err := source.LoadPublished(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if err := producer.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("connect to Kafka: %w", err)
 	}
-	service := voting.New(polls, producer, time.Now)
-	counter := counting.New(producer, resultsrepo.New(pool))
+	results := resultsrepo.New(pool)
 	h := &Handler{
-		Handler: votes.NewHandler(service), voting: service, counting: counter,
-		polls: make(map[uuid.UUID]localPoll, len(polls)), writerID: uuid.New(),
-		closures: closurerepo.New(pool, closeGrace), journal: producer,
+		voting: voting.New(nil, producer, time.Now), counting: counting.New(producer, results),
+		polls: make(map[uuid.UUID]localPoll, len(published)), writerID: uuid.New(),
+		closures: closurerepo.New(pool, closeGrace), journal: producer, source: source,
 	}
-	for _, p := range polls {
-		local := localPoll{poll: p}
-		if time.Now().Before(p.ClosesAt) {
-			if err := counter.Prepare(ctx, p); err != nil {
-				return nil, fmt.Errorf("prepare counting for poll %s: %w", p.ID, err)
-			}
-			local.joined, local.drainDeadline, err = h.closures.Join(ctx, p, h.writerID)
-			if err != nil {
-				return nil, err
-			}
+	for _, p := range published {
+		if err := h.registerPoll(ctx, p); err != nil {
+			return nil, err
 		}
-		if !local.joined {
-			if _, err := service.Seal(p.ID); err != nil {
-				return nil, err
-			}
-		}
-		h.polls[p.ID] = local
 	}
+	adminService := polls.New(source, producer, admin.Partitions, h.registerPoll)
+	mux := http.NewServeMux()
+	mux.Handle("/admin/", adminpolls.NewHandler(adminService, admin.Token))
+	mux.Handle("/api/", votes.NewHandler(h.voting, h.loadForVote))
+	h.Handler = mux
 	return h, nil
 }
 
@@ -104,7 +112,11 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	defer producer.Close()
-	handler, err := NewHandler(startup, pool, producer, closeGrace)
+	partitions, err := strconv.ParseInt(setting("POLL_PARTITIONS", "4"), 10, 32)
+	if err != nil || partitions < 1 {
+		return errors.New("POLL_PARTITIONS must be a positive 32-bit integer")
+	}
+	handler, err := NewHandler(startup, pool, producer, closeGrace, AdminConfig{Token: os.Getenv("ADMIN_TOKEN"), Partitions: int(partitions)})
 	if err != nil {
 		return err
 	}
@@ -126,7 +138,7 @@ func Run(ctx context.Context) error {
 	countsDone := make(chan struct{})
 	go func() {
 		defer close(countsDone)
-		handler.RunCounting(countCtx)
+		handler.ServePolls(countCtx)
 	}()
 	select {
 	case err = <-stopped:
@@ -144,7 +156,10 @@ func Run(ctx context.Context) error {
 	flushErr := producer.Flush(shutdown)
 	if flushErr == nil {
 		// A cleanly stopped writer can acknowledge even before the poll ends.
-		for _, local := range handler.polls {
+		handler.mu.RLock()
+		localPolls := maps.Clone(handler.polls)
+		handler.mu.RUnlock()
+		for _, local := range localPolls {
 			if local.joined {
 				shutdownErr = errors.Join(shutdownErr, handler.closures.Drain(shutdown, local.poll, handler.writerID))
 			}

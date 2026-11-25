@@ -107,8 +107,179 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
               example: {code: unavailable}
+  /admin/polls:
+    post:
+      operationId: createPoll
+      summary: Создать и опубликовать опрос
+      security: [{adminBearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreatePoll'}
+            example:
+              question: Какой вариант вам ближе?
+              choices: [A, B]
+              min_choices: 1
+              max_choices: 1
+              opens_at: '2027-01-15T17:00:00Z'
+              closes_at: '2027-01-15T17:01:00Z'
+      responses:
+        '201':
+          description: Опрос опубликован. Повтор того же запроса с тем же id возвращает тот же результат, в том числе после закрытия.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: {type: string, format: uuid}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409':
+          description: Переданный id уже занят опросом с другими параметрами.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: poll_conflict}
+        '413':
+          description: Тело запроса превышает 1 МиБ.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: payload_too_large}
+        '422':
+          description: Нарушены схема или правила создания опроса, в том числе если окно нового опроса уже закончилось.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: invalid_poll}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /admin/polls/{id}/results:
+    get:
+      operationId: getPollResults
+      summary: Получить статус и обезличенный результат
+      security: [{adminBearer: []}]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Текущий статус опроса. После подсчёта доступны число бюллетеней и результат по вариантам.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PollReport'}
+              example:
+                id: '581fc419-006d-436d-9fc3-a8dd18744719'
+                question: Какой вариант вам ближе?
+                status: final
+                ballots: 2
+                choices: [{id: 1, label: A, votes: 0, percent: 0}, {id: 2, label: B, votes: 2, percent: 100}]
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404':
+          description: Такой опрос не найден.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example: {code: poll_not_found}
+        '503': {$ref: '#/components/responses/Unavailable'}
 components:
+  securitySchemes:
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: Административный секрет из переменной окружения ADMIN_TOKEN.
+  responses:
+    BadRequest:
+      description: Некорректный JSON или идентификатор в пути запроса.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {code: bad_request}
+    Unauthorized:
+      description: Для доступа требуется действующий административный токен.
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, const: Bearer}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {code: unauthorized}
+    Unavailable:
+      description: Временно недоступна зависимость сервиса.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {code: unavailable}
   schemas:
+    CreatePoll:
+      type: object
+      additionalProperties: false
+      required: [question, choices, min_choices, max_choices, opens_at, closes_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Ненулевой UUID для безопасного повтора запроса. При отсутствии ID сервис назначает его сам.
+        question: {type: string, minLength: 1}
+        choices:
+          type: array
+          minItems: 2
+          uniqueItems: true
+          items: {type: string, minLength: 1}
+          description: Непустые названия вариантов в порядке показа. После удаления пробелов по краям названия должны различаться.
+        min_choices: {type: integer, minimum: 1}
+        max_choices:
+          type: integer
+          minimum: 1
+          description: От min_choices до числа вариантов включительно.
+        opens_at: {type: string, format: date-time}
+        closes_at:
+          type: string
+          format: date-time
+          description: Момент закрытия должен быть позже opens_at и ещё не наступить при создании нового опроса.
+    PollReport:
+      type: object
+      additionalProperties: false
+      required: [id, question, status, choices]
+      properties:
+        id: {type: string, format: uuid}
+        question: {type: string}
+        status:
+          type: string
+          enum: [scheduled, open, finalizing, final]
+        ballots:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Число учтённых бюллетеней. Поле появляется в статусе final.
+        choices:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, label]
+            properties:
+              id: {type: integer}
+              label: {type: string}
+              votes: {type: integer, format: int64, minimum: 0}
+              percent:
+                type: [number, 'null']
+                minimum: 0
+                maximum: 100
+                description: Доля бюллетеней с этим вариантом в процентах. При нуле бюллетеней возвращается null.
+      if: {properties: {status: {const: final}}}
+      then:
+        required: [ballots]
+        properties:
+          choices: {items: {required: [votes, percent]}}
+      else:
+        properties:
+          ballots: false
+          choices: {items: {properties: {votes: false, percent: false}}}
     Error:
       type: object
       required: [code]

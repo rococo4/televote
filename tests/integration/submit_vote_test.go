@@ -156,7 +156,7 @@ func newPollFixture(t *testing.T, ctx context.Context, openFor, closeGrace time.
 		t.Fatal(err)
 	}
 	t.Cleanup(writer.Close)
-	handler, err := app.NewHandler(ctx, pool, writer, closeGrace)
+	handler, err := app.NewHandler(ctx, pool, writer, closeGrace, app.AdminConfig{Partitions: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,12 +8,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rococo4/televote/internal/entity"
 )
 
-// Algorithm 1 counts the last admissible ballot in partition order.
-const algorithm = 1
+// AlgorithmVersion identifies the rule that counts the last admissible ballot in partition order.
+const AlgorithmVersion = 1
 
 //go:embed queries/save_partition.sql
 var savePartitionSQL string
@@ -28,17 +29,24 @@ type Repository struct {
 func New(pool *pgxpool.Pool) *Repository { return &Repository{pool: pool} }
 
 func (r *Repository) Bind(ctx context.Context, p entity.Poll, topicID uuid.UUID) error {
+	return BindTopic(ctx, r.pool, p, topicID)
+}
+
+// BindTopic accepts either a pool or the transaction publishing a new poll.
+func BindTopic(ctx context.Context, db interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, p entity.Poll, topicID uuid.UUID) error {
 	if topicID == uuid.Nil {
 		return errors.New("empty Kafka topic ID")
 	}
-	tag, err := r.pool.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		INSERT INTO poll_count_manifests AS m (poll_id, version, algorithm, topic, topic_id, partitions)
 		SELECT id, version, $3, topic, $4, partitions FROM polls
 		WHERE id = $1 AND version = $2 AND topic = $5 AND partitions = $6
 		ON CONFLICT (poll_id, version, algorithm) DO UPDATE
 		    SET topic_id = m.topic_id
 		    WHERE (m.topic, m.topic_id, m.partitions) = (excluded.topic, excluded.topic_id, excluded.partitions)`,
-		p.ID, p.Version, algorithm, topicID, p.Topic, p.Partitions)
+		p.ID, p.Version, AlgorithmVersion, topicID, p.Topic, p.Partitions)
 	if err != nil {
 		return fmt.Errorf("bind Kafka topic for poll %s: %w", p.ID, err)
 	}
@@ -55,7 +63,7 @@ func (r *Repository) BoundTopic(ctx context.Context, p entity.Poll) (uuid.UUID, 
 	err := r.pool.QueryRow(ctx, `
 		SELECT topic_id, topic, partitions FROM poll_count_manifests
 		WHERE poll_id = $1 AND version = $2 AND algorithm = $3`,
-		p.ID, p.Version, algorithm).Scan(&id, &name, &partitions)
+		p.ID, p.Version, AlgorithmVersion).Scan(&id, &name, &partitions)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
 	}
@@ -76,7 +84,7 @@ func (r *Repository) Progress(ctx context.Context, p entity.Poll) (bool, map[int
 		               WHERE poll_id = $1 AND version = $2 AND algorithm = $3),
 		       ARRAY(SELECT partition_id FROM poll_partition_results
 		             WHERE poll_id = $1 AND version = $2 AND algorithm = $3)`,
-		p.ID, p.Version, algorithm).Scan(&final, &partitions)
+		p.ID, p.Version, AlgorithmVersion).Scan(&final, &partitions)
 	if err != nil {
 		return false, nil, fmt.Errorf("load counting progress: %w", err)
 	}
@@ -97,7 +105,7 @@ func (r *Repository) SavePartition(ctx context.Context, p entity.Poll, result en
 			return fmt.Errorf("invalid count for choice %d", id)
 		}
 	}
-	tag, err := r.pool.Exec(ctx, savePartitionSQL, p.ID, p.Version, algorithm, result.Partition,
+	tag, err := r.pool.Exec(ctx, savePartitionSQL, p.ID, p.Version, AlgorithmVersion, result.Partition,
 		result.StartOffset, result.EndOffset, result.Ballots, result.Counts)
 	if err != nil {
 		return fmt.Errorf("save result for partition %d: %w", result.Partition, err)
@@ -109,7 +117,7 @@ func (r *Repository) SavePartition(ctx context.Context, p entity.Poll, result en
 }
 
 func (r *Repository) Finalize(ctx context.Context, p entity.Poll) error {
-	tag, err := r.pool.Exec(ctx, finalizeSQL, p.ID, p.Version, algorithm)
+	tag, err := r.pool.Exec(ctx, finalizeSQL, p.ID, p.Version, AlgorithmVersion)
 	if err != nil {
 		return fmt.Errorf("save final result for poll %s: %w", p.ID, err)
 	}

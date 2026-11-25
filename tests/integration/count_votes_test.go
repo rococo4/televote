@@ -87,7 +87,7 @@ func TestCountVotesAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
-	restarted, err := app.NewHandler(ctx, f.pool, producer, testCloseGrace)
+	restarted, err := app.NewHandler(ctx, f.pool, producer, testCloseGrace, app.AdminConfig{Partitions: 4})
 	if err != nil {
 		t.Fatal(err)
 	}

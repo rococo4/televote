@@ -1,6 +1,7 @@
 package votes
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 
 const maxBodyBytes = 1 << 20
 
-func NewHandler(service *voting.Service) http.Handler {
+func NewHandler(service *voting.Service, loadPoll func(context.Context, uuid.UUID) error) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/polls/{id}/votes", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -34,6 +35,11 @@ func NewHandler(service *voting.Service) http.Handler {
 			return
 		}
 		admission, err := service.Begin(pollID)
+		if errors.Is(err, voting.ErrPollNotFound) && loadPoll != nil {
+			if err = loadPoll(r.Context(), pollID); err == nil {
+				admission, err = service.Begin(pollID)
+			}
+		}
 		if err != nil {
 			writeServiceError(w, err)
 			return

@@ -45,6 +45,27 @@ func New(polls []entity.Poll, publisher Publisher, now func() time.Time) *Servic
 	return &Service{polls: snapshot, publisher: publisher, now: now}
 }
 
+// Register publishes an immutable intake snapshot after this process has checked
+// writer membership. Re-registration must preserve outstanding admissions.
+func (s *Service) Register(p entity.Poll, joined bool) error {
+	s.gate.Lock()
+	defer s.gate.Unlock()
+	if s.draining {
+		return ErrUnavailable
+	}
+	if _, ok := s.polls[p.ID]; ok {
+		return nil
+	}
+	p.Choices = maps.Clone(p.Choices)
+	intake := &pollIntake{poll: p}
+	if !joined {
+		intake.sealed = make(chan struct{})
+		close(intake.sealed)
+	}
+	s.polls[p.ID] = intake
+	return nil
+}
+
 func (s *Service) Submit(ctx context.Context, a *Admission, token [16]byte, ballot entity.Ballot) error {
 	if err := a.poll.ValidateBallot(ballot); err != nil {
 		return err

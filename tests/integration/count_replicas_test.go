@@ -44,7 +44,7 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 			}
 			t.Cleanup(writer.Close)
 			gate := &delayedJournal{Producer: writer, ctx: ctx, admitted: make(chan struct{}), release: make(chan struct{}), delivered: make(chan struct{})}
-			second, err := app.NewHandler(ctx, f.pool, gate, 12*time.Second)
+			second, err := app.NewHandler(ctx, f.pool, gate, 12*time.Second, app.AdminConfig{Partitions: 4})
 			if err != nil {
 				t.Fatal(err)
 			}
