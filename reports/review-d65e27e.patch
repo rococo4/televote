@@ -1,0 +1,138 @@
+--- a/internal/api/http/votes/handler_test.go
++++ b/internal/api/http/votes/handler_test.go
+@@ -93,0 +94,19 @@
++
++func TestReviewColdOpen(t *testing.T) {
++	opens := time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC)
++	now := opens.Add(-time.Millisecond)
++	p := entity.Poll{ID: uuid.New(), OpensAt: opens, ClosesAt: opens.Add(time.Minute), MinChoices: 1, MaxChoices: 1, Choices: map[int]struct{}{1: {}}}
++	writer := &recordingPublisher{}
++	s := voting.New(nil, writer, func() time.Time { return now })
++	h := NewHandler(s, func(ctx context.Context, id uuid.UUID) error {
++		now = opens.Add(time.Millisecond)
++		return s.Register(p, true)
++	})
++	r := httptest.NewRequest(http.MethodPost, "/api/polls/"+p.ID.String()+"/votes", strings.NewReader(`{"token":"00000000000000000000000000000000","choices":[1]}`))
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	if w.Code != http.StatusAccepted || len(writer.events) != 1 {
++		t.Fatalf("observed status=%d events=%d", w.Code, len(writer.events))
++	}
++	t.Logf("complete body at opens_at-1ms; status=%d recorded_at=opens_at+%v", w.Code, writer.events[0].ReceivedAt.Sub(opens))
++}
+--- a/internal/repository/resultsrepo/postgres_integration_test.go
++++ b/internal/repository/resultsrepo/postgres_integration_test.go
+@@ -19 +19 @@
+-func TestPartitionCheckpoints(t *testing.T) {
++func TestReviewCheckpointConflict(t *testing.T) {
+@@ -65,0 +66,4 @@
++	first.Counts = map[int]int64{1: 1, 2: 1}
++	if err := repo.SavePartition(ctx, p, first); err == nil {
++		t.Fatal("replay overwrote an existing partition with conflicting counts")
++	}
+@@ -75,4 +79 @@
+-	first.Counts = map[int]int64{1: 1, 2: 1}
+-	if err := repo.SavePartition(ctx, p, first); err == nil {
+-		t.Fatal("replay overwrote an existing partition with conflicting counts")
+-	}
++	t.Log("conflicting replay rejected before last checkpoint; Finalize subsequently succeeded")
+--- a/tests/integration/submit_vote_test.go
++++ b/tests/integration/submit_vote_test.go
+@@ -11,0 +12 @@
++	"github.com/rococo4/televote/internal/repository/pollsrepo"
+@@ -294,0 +296,95 @@
++
++func TestReviewOrphanJournal(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
++	defer cancel()
++	f := newVoteFixture(t, ctx, time.Minute)
++	id := uuid.New()
++	topic := "televote-" + id.String()
++	createTopic(t, ctx, f.reader, topic)
++	old := entity.Poll{ID: id, Version: 1, Topic: topic, Partitions: partitions}
++	for n := range partitions {
++		if err := f.writer.MarkClosed(ctx, old, int32(n)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	h, err := app.NewHandler(ctx, f.pool, f.writer, time.Second, app.AdminConfig{Token: "review-only", Partitions: partitions})
++	if err != nil {
++		t.Fatal(err)
++	}
++	srv := httptest.NewServer(h)
++	defer srv.Close()
++	now := time.Now().UTC().Truncate(time.Microsecond)
++	ends := now.Add(2 * time.Second)
++	body, err := json.Marshal(map[string]any{"id": id, "question": "New broadcast", "opens_at": now.Add(-time.Minute), "closes_at": ends, "choices": []string{"A", "B"}, "min_choices": 1, "max_choices": 1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/admin/polls", bytes.NewReader(body))
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("Authorization", "Bearer review-only")
++	res, err := srv.Client().Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	res.Body.Close()
++	if res.StatusCode != 201 {
++		t.Fatalf("create status %d", res.StatusCode)
++	}
++	code, _ := sendBallot(t, ctx, srv.Client(), srv.URL+"/api/polls/"+id.String()+"/votes", "11111111111111111111111111111111", []int{1})
++	if code != 202 {
++		t.Fatalf("vote status %d", code)
++	}
++	time.Sleep(time.Until(ends))
++	if err := h.CountClosedPoll(ctx, id); err != nil {
++		t.Fatal(err)
++	}
++	result, err := pollsrepo.New(f.pool).Results(ctx, id)
++	if err != nil || result.Ballots == nil {
++		t.Fatalf("result: %+v, %v", result, err)
++	}
++	t.Logf("pre-existing CLOSE for same ID and version: create=%d vote=%d status=%s ballots=%d", res.StatusCode, code, result.Status, *result.Ballots)
++	if *result.Ballots != 0 {
++		t.Fatal("old CLOSE did not mask accepted vote")
++	}
++}
++
++func TestReviewExpiredUnpublishedDraft(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
++	defer cancel()
++	f := newVoteFixture(t, ctx, time.Minute)
++	id := uuid.New()
++	tname := "televote-" + id.String()
++	createTopic(t, ctx, f.reader, tname)
++	now := time.Now().UTC().Truncate(time.Microsecond)
++	spec := entity.CreatePoll{ID: id, Question: "expired unpublished", Choices: []string{"A", "B"}, OpensAt: now.Add(-time.Minute), ClosesAt: now.Add(500 * time.Millisecond), MinChoices: 1, MaxChoices: 1}
++	if _, published, err := pollsrepo.New(f.pool).Draft(ctx, spec, partitions); err != nil || published {
++		t.Fatalf("reserve unpublished: %v", err)
++	}
++	h, err := app.NewHandler(ctx, f.pool, f.writer, time.Second, app.AdminConfig{Token: "review-only", Partitions: partitions})
++	if err != nil {
++		t.Fatal(err)
++	}
++	srv := httptest.NewServer(h)
++	defer srv.Close()
++	time.Sleep(time.Until(spec.ClosesAt.Add(20 * time.Millisecond)))
++	b, err := json.Marshal(map[string]any{"id": id, "question": spec.Question, "opens_at": spec.OpensAt, "closes_at": spec.ClosesAt, "choices": spec.Choices, "min_choices": 1, "max_choices": 1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/admin/polls", bytes.NewReader(b))
++	if err != nil {
++		t.Fatal(err)
++	}
++	req.Header.Set("Authorization", "Bearer review-only")
++	res, err := srv.Client().Do(req)
++	if err != nil {
++		t.Fatal(err)
++	}
++	res.Body.Close()
++	t.Logf("first publication of expired draft: HTTP %d", res.StatusCode)
++	if res.StatusCode != 201 {
++		t.Fatal("expected observation changed")
++	}
++}
