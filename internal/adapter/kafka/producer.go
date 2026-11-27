@@ -28,6 +28,9 @@ func New(brokers []string) (*Producer, error) {
 	}
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
+		// У нового топика лидер ещё может смениться. Стандартные 5 с между
+		// обновлениями метаданных исчерпывают весь срок отправки голоса.
+		kgo.MetadataMinAge(50*time.Millisecond),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.RecordPartitioner(kgo.ManualPartitioner()),
 		kgo.MaxBufferedRecords(16_384),
