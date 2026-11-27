@@ -6,6 +6,6 @@ SELECT p.id, p.question,
        f.ballots, c.id, c.label, (f.counts ->> c.id::text)::bigint
 FROM polls p
 JOIN poll_choices c ON c.poll_id = p.id
-LEFT JOIN poll_results f ON f.poll_id = p.id AND f.version = p.version AND f.algorithm = $2
+LEFT JOIN poll_results f ON f.poll_id = p.id
 WHERE p.id = $1 AND p.published
 ORDER BY c.id

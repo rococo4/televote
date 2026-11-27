@@ -7,14 +7,16 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-// Admission tracks a complete request through validation and the producer ACK.
+// Admission фиксирует время приёма запроса. При закрытии опроса сервис ждёт,
+// пока обработчик проверит бюллетень и завершит попытку записи в Kafka.
 type Admission struct {
 	poll       entity.Poll
 	receivedAt time.Time
 	done       func()
 }
 
-// Finish releases the registration. Call it once, even when the body is invalid.
+// Finish снимает запрос с учёта. Обработчик вызывает его ровно один раз,
+// в том числе при ошибке разбора бюллетеня.
 func (a *Admission) Finish() { a.done() }
 
 func (s *Service) Begin(pollID uuid.UUID) (*Admission, error) {
@@ -38,8 +40,8 @@ func (s *Service) Begin(pollID uuid.UUID) (*Admission, error) {
 	return &Admission{poll: intake.poll, receivedAt: receivedAt, done: intake.inFlight.Done}, nil
 }
 
-// Seal stops admissions permanently. The returned channel closes when every
-// admitted handler has finished and no more sends can be queued for this poll.
+// Seal закрывает приём голосов по опросу. Сервис закрывает канал после того,
+// как завершится последний обработчик, который ещё мог отправить голос в Kafka.
 func (s *Service) Seal(id uuid.UUID) (<-chan struct{}, error) {
 	s.gate.Lock()
 	defer s.gate.Unlock()
@@ -57,7 +59,8 @@ func (s *Service) Seal(id uuid.UUID) (<-chan struct{}, error) {
 	return intake.sealed, nil
 }
 
-// Drain stops new admissions and waits for all registered handlers to finish.
+// Drain при остановке сервиса закрывает приём голосов по всем опросам
+// и ждёт, пока завершатся уже принятые запросы.
 func (s *Service) Drain() {
 	s.gate.Lock()
 	s.draining = true

@@ -1,11 +1,10 @@
 package entity
 
-// PartitionResult describes one complete pass up to the first CLOSE.
-// EndOffset is the position of the marker, excluded from the ballot range.
+// PartitionResult хранит итог одной партиции по записям до первого маркера CLOSE.
+// EndOffset — позиция этого маркера.
 type PartitionResult struct {
-	Partition   int32
-	StartOffset int64
-	EndOffset   int64
-	Ballots     int64
-	Counts      map[int]int64
+	Partition int32
+	EndOffset int64
+	Ballots   int64
+	Counts    map[int]int64
 }

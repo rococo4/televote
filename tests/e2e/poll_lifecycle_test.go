@@ -6,8 +6,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -53,42 +55,70 @@ type report struct {
 }
 
 func TestPollLifecycle(t *testing.T) {
-	a, b := startReplicas(t)
+	start := replicaStarter(t)
+	a, b := start(3*time.Second), start(3*time.Second)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	p := pollInput{
 		ID: uuid.NewString(), Question: "Which programme?", Choices: []string{"A", "B"},
 		OpensAt: now.Add(-time.Minute), ClosesAt: now.Add(4 * time.Second), MinChoices: 1, MaxChoices: 1,
 	}
 	createURL := a.URL + "/admin/polls"
-	request(t, http.MethodPost, createURL, "", p, http.StatusUnauthorized)
+	request(t, http.DefaultClient, http.MethodPost, createURL, "", p, http.StatusUnauthorized)
 	invalid := p
 	invalid.MaxChoices = 3
-	request(t, http.MethodPost, createURL, adminToken, invalid, http.StatusUnprocessableEntity)
+	invalidReply := request(t, http.DefaultClient, http.MethodPost, createURL, adminToken, invalid, http.StatusBadRequest)
+	checkBadRequest(t, invalidReply, "Некорректные параметры опроса.")
 	id := createPoll(t, createURL, p)
 	if id != p.ID {
 		t.Fatalf("created poll %q, want %q", id, p.ID)
 	}
 
-	// The second instance was already running when A created the poll.
-	// Send its first vote immediately, without priming its cache or retrying.
-	vote := func(server *httptest.Server, token string, choice, wantStatus int) {
+	pollPath := "/api/polls/" + id
+	vote := func(browser *http.Client, server *httptest.Server, choice, wantStatus int) []byte {
 		t.Helper()
-		request(t, http.MethodPost, server.URL+"/api/polls/"+id+"/votes", "",
-			map[string]any{"token": token, "choices": []int{choice}}, wantStatus)
+		return request(t, browser, http.MethodPost, server.URL+pollPath+"/votes", "",
+			map[string]any{"choices": []int{choice}}, wantStatus)
 	}
-	const x, y = "10000000000000000000000000000001", "20000000000000000000000000000002"
-	vote(b.Server, x, 1, http.StatusAccepted)
-	vote(a.Server, x, 2, http.StatusAccepted)
-	vote(b.Server, y, 2, http.StatusAccepted)
+	openPoll := func(browser *http.Client, server *httptest.Server) {
+		t.Helper()
+		data := request(t, browser, http.MethodGet, server.URL+pollPath, "", nil, http.StatusOK)
+		var got report
+		if err := json.Unmarshal(data, &got); err != nil || got.ID != id || got.Question != p.Question ||
+			len(got.Choices) != 2 || got.Choices[0].ID != 1 || got.Choices[0].Label != "A" ||
+			got.Choices[1].ID != 2 || got.Choices[1].Label != "B" {
+			t.Fatalf("public poll: %s (error: %v)", data, err)
+		}
+	}
+
+	x, y := newBrowser(t), newBrowser(t)
+	checkBadRequest(t, vote(x, a.Server, 1, http.StatusBadRequest), "Для голосования откройте опрос и разрешите cookie.")
+	openPoll(x, a.Server)
+	// Первая реплика выдала cookie. Вторая принимает первый голос даже с холодным кэшем.
+	// Когда ответ 202 теряется, браузер повторяет выбор с той же cookie.
+	lossy := &http.Client{Jar: x.Jar, Transport: loseAcceptedResponse{}, Timeout: 5 * time.Second}
+	res, err := lossy.Post(b.URL+pollPath+"/votes", "application/json", strings.NewReader(`{"choices":[1]}`))
+	if err == nil {
+		res.Body.Close()
+		t.Fatalf("expected a lost HTTP 202, got HTTP %d", res.StatusCode)
+	}
+	if !errors.Is(err, errVoteResponseLost) {
+		t.Fatal(err)
+	}
+	openPoll(x, b.Server)
+	vote(x, a.Server, 1, http.StatusAccepted)
+	vote(x, b.Server, 2, http.StatusAccepted)
+	openPoll(y, b.Server)
+	vote(y, a.Server, 2, http.StatusAccepted)
 
 	if retry := createPoll(t, b.URL+"/admin/polls", p); retry != id {
 		t.Fatalf("same create request returned %q instead of %q", retry, id)
 	}
 	conflict := p
 	conflict.Question = "A different question"
-	request(t, http.MethodPost, createURL, adminToken, conflict, http.StatusConflict)
+	conflictReply := request(t, http.DefaultClient, http.MethodPost, createURL, adminToken, conflict, http.StatusBadRequest)
+	checkBadRequest(t, conflictReply, "Этот ID занят опросом с другими параметрами.")
 	path := "/admin/polls/" + id + "/results"
-	request(t, http.MethodGet, a.URL+path, "incorrect", nil, http.StatusUnauthorized)
+	request(t, http.DefaultClient, http.MethodGet, a.URL+path, "incorrect", nil, http.StatusUnauthorized)
 	open := readReport(t, a.URL+path)
 	if open.Status != "open" {
 		t.Fatalf("status during voting = %q", open.Status)
@@ -98,11 +128,73 @@ func TestPollLifecycle(t *testing.T) {
 		t.Fatalf("unexpected final report: %+v", final)
 	}
 	assertChoices(t, final, []int{0, 2})
-	vote(a.Server, x, 1, http.StatusGone)
+	checkBadRequest(t, vote(x, a.Server, 1, http.StatusBadRequest), "Опрос закрыт.")
+}
+
+func checkBadRequest(t *testing.T, body []byte, message string) {
+	t.Helper()
+	var reply struct{ Code, Message string }
+	if err := json.Unmarshal(body, &reply); err != nil || reply.Code != "bad_request" || reply.Message != message {
+		t.Fatalf("expected bad_request with message %q, got %s", message, body)
+	}
+}
+
+func newBrowser(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Jar: jar}
+}
+
+type loseAcceptedResponse struct{}
+
+var errVoteResponseLost = errors.New("discarded HTTP 202")
+
+func (loseAcceptedResponse) RoundTrip(req *http.Request) (*http.Response, error) {
+	res, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil || res.StatusCode != http.StatusAccepted {
+		return res, err
+	}
+	res.Body.Close()
+	return nil, errVoteResponseLost
+}
+
+func TestSeparateBroadcastsOfSameQuestion(t *testing.T) {
+	start := replicaStarter(t)
+	a, b := start(3*time.Second), start(3*time.Second)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	p := pollInput{
+		Question: "A или B?", Choices: []string{"A", "B"},
+		OpensAt: now.Add(-time.Second), ClosesAt: now.Add(4 * time.Second), MinChoices: 1, MaxChoices: 1,
+	}
+	// Одинаковый вопрос можно задать в двух эфирах. Каждый POST без ID создаёт новый опрос.
+	first := createPoll(t, a.URL+"/admin/polls", p)
+	second := createPoll(t, b.URL+"/admin/polls", p)
+	if first == second {
+		t.Fatal("separate broadcasts received the same poll ID")
+	}
+	browser := newBrowser(t)
+	for i, id := range []string{first, second} {
+		pollURL := b.URL + "/api/polls/" + id
+		request(t, browser, http.MethodGet, pollURL, "", nil, http.StatusOK)
+		request(t, browser, http.MethodPost, pollURL+"/votes", "", map[string]any{"choices": []int{i + 1}}, http.StatusAccepted)
+	}
+	for i, id := range []string{first, second} {
+		final := awaitFinal(t, a.URL+"/admin/polls/"+id+"/results")
+		if final.ID != id || final.Ballots == nil || *final.Ballots != 1 {
+			t.Fatalf("unexpected final report for broadcast %s: %+v", id, final)
+		}
+		want := []int{0, 0}
+		want[i] = 1
+		assertChoices(t, final, want)
+	}
 }
 
 func TestEmptyPollSurvivesCreatorShutdown(t *testing.T) {
-	a, b := startReplicas(t)
+	start := replicaStarter(t)
+	a := start(3 * time.Second)
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	p := pollInput{
 		Question: "Never voted on", Choices: []string{"A", "B"},
@@ -114,9 +206,10 @@ func TestEmptyPollSurvivesCreatorShutdown(t *testing.T) {
 		t.Fatalf("status before opening = %q", scheduled.Status)
 	}
 	a.stop()
-	// The creator cannot acknowledge its drain. The grace period keeps
-	// the report provisional while the remaining instance takes over.
+	// Создатель опроса остановился до drained_at. Б запустится уже после эфира,
+	// возьмёт оставшееся время из PostgreSQL и опубликует итог без новых голосов.
 	time.Sleep(time.Until(p.ClosesAt.Add(50 * time.Millisecond)))
+	b := start(time.Minute)
 	if interim := readReport(t, b.URL+path); interim.Status != "finalizing" {
 		t.Fatalf("status after deadline while a writer is missing = %q", interim.Status)
 	}
@@ -127,7 +220,7 @@ func TestEmptyPollSurvivesCreatorShutdown(t *testing.T) {
 	assertChoices(t, final, []int{0, 0})
 }
 
-func request(t *testing.T, method, url, auth string, input any, want int) []byte {
+func request(t *testing.T, client *http.Client, method, url, auth string, input any, want int) []byte {
 	t.Helper()
 	var body bytes.Buffer
 	if input != nil {
@@ -147,7 +240,7 @@ func request(t *testing.T, method, url, auth string, input any, want int) []byte
 	if auth != "" {
 		req.Header.Set("Authorization", "Bearer "+auth)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +254,7 @@ func request(t *testing.T, method, url, auth string, input any, want int) []byte
 
 func createPoll(t *testing.T, url string, p pollInput) string {
 	t.Helper()
-	data := request(t, http.MethodPost, url, adminToken, p, http.StatusCreated)
+	data := request(t, http.DefaultClient, http.MethodPost, url, adminToken, p, http.StatusCreated)
 	var created struct{ ID string }
 	if err := json.Unmarshal(data, &created); err != nil || uuid.Validate(created.ID) != nil {
 		t.Fatalf("expected created poll ID, got %s", data)
@@ -171,19 +264,27 @@ func createPoll(t *testing.T, url string, p pollInput) string {
 
 func readReport(t *testing.T, url string) report {
 	t.Helper()
-	data := request(t, http.MethodGet, url, adminToken, nil, http.StatusOK)
+	data := request(t, http.DefaultClient, http.MethodGet, url, adminToken, nil, http.StatusOK)
 	var r report
-	// The public result contract admits only aggregate fields, including inside choices.
+	// Проверяем состав ответа, в том числе поля каждого варианта. Данные отдельных бюллетеней в отчёт не входят.
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&r); err != nil {
 		t.Fatalf("invalid report: %v; body=%s", err, data)
 	}
 	if r.Status != "final" {
-		if r.Ballots != nil {
+		// RawMessage отличает отсутствие поля от явного null.
+		var totals struct {
+			Ballots json.RawMessage
+			Choices []struct{ Votes, Percent json.RawMessage }
+		}
+		if err := json.Unmarshal(data, &totals); err != nil {
+			t.Fatal(err)
+		}
+		if totals.Ballots != nil {
 			t.Fatalf("partial ballot count exposed: %s", data)
 		}
-		for _, c := range r.Choices {
+		for _, c := range totals.Choices {
 			if c.Votes != nil || c.Percent != nil {
 				t.Fatalf("partial option totals exposed: %s", data)
 			}
@@ -239,7 +340,7 @@ type replica struct {
 	stop func()
 }
 
-func startReplicas(t *testing.T) (replica, replica) {
+func replicaStarter(t *testing.T) func(time.Duration) replica {
 	t.Helper()
 	brokers := strings.Split(setting("KAFKA_BROKERS", "127.0.0.1:59092"), ",")
 	cfg, err := pgxpool.ParseConfig(setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
@@ -278,7 +379,7 @@ func startReplicas(t *testing.T) (replica, replica) {
 	}
 	t.Cleanup(func() { deleteTestTopics(t, db, brokers) })
 
-	start := func() replica {
+	return func(grace time.Duration) replica {
 		pool, err := pgxpool.NewWithConfig(t.Context(), cfg.Copy())
 		if err != nil {
 			t.Fatal(err)
@@ -288,18 +389,18 @@ func startReplicas(t *testing.T) (replica, replica) {
 			pool.Close()
 			t.Fatal(err)
 		}
-		h, err := app.NewHandler(t.Context(), pool, journal, 3*time.Second, app.AdminConfig{Token: adminToken, Partitions: 4})
+		application, err := app.New(t.Context(), pool, journal, grace, app.AdminConfig{Token: adminToken, Partitions: 4})
 		if err != nil {
 			journal.Close()
 			pool.Close()
 			t.Fatal(err)
 		}
-		server := httptest.NewServer(h)
+		server := httptest.NewServer(application)
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			h.ServePolls(ctx)
+			application.ServePolls(ctx)
 		}()
 		stop := sync.OnceFunc(func() {
 			server.Close()
@@ -311,7 +412,6 @@ func startReplicas(t *testing.T) (replica, replica) {
 		t.Cleanup(stop)
 		return replica{server, stop}
 	}
-	return start(), start()
 }
 
 func deleteTestTopics(t *testing.T, db *pgxpool.Pool, brokers []string) {

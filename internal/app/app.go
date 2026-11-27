@@ -49,7 +49,14 @@ type localPoll struct {
 	drainDeadline time.Time
 }
 
-type Handler struct {
+type closureStore interface {
+	Join(context.Context, entity.Poll, uuid.UUID) (bool, time.Time, error)
+	Drain(context.Context, entity.Poll, uuid.UUID) error
+	Decide(context.Context, entity.Poll) (bool, time.Time, error)
+}
+
+// App объединяет HTTP-маршруты и фоновые задачи одной реплики сервиса.
+type App struct {
 	http.Handler
 	voting   *voting.Service
 	counting *counting.Service
@@ -59,11 +66,11 @@ type Handler struct {
 	loading  singleflight.Group
 	source   *pollsrepo.Repository
 	writerID uuid.UUID
-	closures *closurerepo.Repository
+	closures closureStore
 	journal  VoteJournal
 }
 
-func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, closeGrace time.Duration, admin AdminConfig) (*Handler, error) {
+func New(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, closeGrace time.Duration, admin AdminConfig) (*App, error) {
 	source := pollsrepo.New(pool)
 	published, err := source.LoadPublished(ctx)
 	if err != nil {
@@ -73,22 +80,22 @@ func NewHandler(ctx context.Context, pool *pgxpool.Pool, producer VoteJournal, c
 		return nil, fmt.Errorf("connect to Kafka: %w", err)
 	}
 	results := resultsrepo.New(pool)
-	h := &Handler{
+	application := &App{
 		voting: voting.New(nil, producer, time.Now), counting: counting.New(producer, results),
 		polls: make(map[uuid.UUID]localPoll, len(published)), writerID: uuid.New(),
 		closures: closurerepo.New(pool, closeGrace), journal: producer, source: source,
 	}
 	for _, p := range published {
-		if err := h.registerPoll(ctx, p); err != nil {
+		if err := application.registerPoll(ctx, p); err != nil {
 			return nil, err
 		}
 	}
-	adminService := polls.New(source, producer, admin.Partitions, h.registerPoll)
+	adminService := polls.New(source, producer, admin.Partitions, application.registerPoll)
 	mux := http.NewServeMux()
 	mux.Handle("/admin/", adminpolls.NewHandler(adminService, admin.Token))
-	mux.Handle("/api/", votes.NewHandler(h.voting, h.loadForVote))
-	h.Handler = mux
-	return h, nil
+	mux.Handle("/api/", votes.NewHandler(application.voting, application.loadForVote))
+	application.Handler = mux
+	return application, nil
 }
 
 func Run(ctx context.Context) error {
@@ -116,7 +123,7 @@ func Run(ctx context.Context) error {
 	if err != nil || partitions < 1 {
 		return errors.New("POLL_PARTITIONS must be a positive 32-bit integer")
 	}
-	handler, err := NewHandler(startup, pool, producer, closeGrace, AdminConfig{Token: os.Getenv("ADMIN_TOKEN"), Partitions: int(partitions)})
+	application, err := New(startup, pool, producer, closeGrace, AdminConfig{Token: os.Getenv("ADMIN_TOKEN"), Partitions: int(partitions)})
 	if err != nil {
 		return err
 	}
@@ -125,7 +132,7 @@ func Run(ctx context.Context) error {
 		return err
 	}
 	server := &http.Server{
-		Handler:           handler,
+		Handler:           application,
 		ReadHeaderTimeout: 3 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      20 * time.Second,
@@ -138,7 +145,7 @@ func Run(ctx context.Context) error {
 	countsDone := make(chan struct{})
 	go func() {
 		defer close(countsDone)
-		handler.ServePolls(countCtx)
+		application.ServePolls(countCtx)
 	}()
 	select {
 	case err = <-stopped:
@@ -151,17 +158,17 @@ func Run(ctx context.Context) error {
 	if shutdownErr != nil {
 		_ = server.Close()
 	}
-	handler.voting.Drain()
+	application.voting.Drain()
 	<-countsDone
 	flushErr := producer.Flush(shutdown)
 	if flushErr == nil {
-		// A cleanly stopped writer can acknowledge even before the poll ends.
-		handler.mu.RLock()
-		localPolls := maps.Clone(handler.polls)
-		handler.mu.RUnlock()
+		// Реплика завершила все отправки и может поставить drained_at даже до конца опроса.
+		application.mu.RLock()
+		localPolls := maps.Clone(application.polls)
+		application.mu.RUnlock()
 		for _, local := range localPolls {
 			if local.joined {
-				shutdownErr = errors.Join(shutdownErr, handler.closures.Drain(shutdown, local.poll, handler.writerID))
+				shutdownErr = errors.Join(shutdownErr, application.closures.Drain(shutdown, local.poll, application.writerID))
 			}
 		}
 	}

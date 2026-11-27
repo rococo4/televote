@@ -15,7 +15,8 @@ var (
 
 type Poll struct {
 	ID         uuid.UUID
-	Version    int64
+	Question   string
+	Options    []PollChoice
 	OpensAt    time.Time
 	ClosesAt   time.Time
 	MinChoices int
@@ -23,6 +24,21 @@ type Poll struct {
 	Choices    map[int]struct{}
 	Topic      string
 	Partitions int
+}
+
+type PollChoice struct {
+	ID    int    `json:"id"`
+	Label string `json:"label"`
+}
+
+type PublicPoll struct {
+	ID         uuid.UUID    `json:"id"`
+	Question   string       `json:"question"`
+	Choices    []PollChoice `json:"choices"`
+	OpensAt    time.Time    `json:"opens_at"`
+	ClosesAt   time.Time    `json:"closes_at"`
+	MinChoices int          `json:"min_choices"`
+	MaxChoices int          `json:"max_choices"`
 }
 
 func (p Poll) CheckWindow(at time.Time) error {

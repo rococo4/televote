@@ -25,7 +25,8 @@ type CreatePoll struct {
 	MinChoices, MaxChoices int
 }
 
-// Normalize uses PostgreSQL timestamp precision so an identical retry compares equal.
+// Normalize приводит время к точности PostgreSQL. При повторном запросе границы
+// голосования совпадут со значениями, которые сохранились при первом запросе.
 func (p CreatePoll) Normalize() (CreatePoll, error) {
 	p.OpensAt = p.OpensAt.UTC().Truncate(time.Microsecond)
 	p.ClosesAt = p.ClosesAt.UTC().Truncate(time.Microsecond)
@@ -67,7 +68,8 @@ type ChoiceResult struct {
 	Percent *float64 `json:"percent,omitempty"`
 }
 
-// Final reports explicitly represent an undefined percentage when no ballots were cast.
+// Поле percent появляется в итоговом отчёте. Если никто не проголосовал,
+// возвращаем null: долю голосов за вариант в этом случае вычислить нельзя.
 func (c ChoiceResult) MarshalJSON() ([]byte, error) {
 	type choice ChoiceResult
 	if c.Votes == nil {

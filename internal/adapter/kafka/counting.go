@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -14,7 +15,8 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-// TopicID binds the poll to a specific Kafka topic incarnation and partition set.
+// TopicID проверяет, что состав партиций совпадает с настройками опроса,
+// и возвращает UUID топика. При пересоздании топика под тем же именем UUID изменится.
 func (p *Producer) TopicID(ctx context.Context, poll entity.Poll) (uuid.UUID, error) {
 	req := kmsg.NewPtrMetadataRequest()
 	req.AllowAutoTopicCreation = false
@@ -53,7 +55,7 @@ func (p *Producer) MarkClosed(ctx context.Context, poll entity.Poll, partition i
 	if partition < 0 || int(partition) >= poll.Partitions {
 		return fmt.Errorf("partition %d outside poll %s", partition, poll.ID)
 	}
-	value, err := json.Marshal(eventHeader{Type: "CLOSE", PollID: poll.ID, Version: poll.Version})
+	value, err := json.Marshal(eventHeader{Type: "CLOSE", PollID: poll.ID})
 	if err != nil {
 		return err
 	}
@@ -61,69 +63,19 @@ func (p *Producer) MarkClosed(ctx context.Context, poll entity.Poll, partition i
 	return p.client.ProduceSync(ctx, record).FirstErr()
 }
 
-// ReadPartition replays a dedicated poll log, whose initial offsets are zero.
-// Each task owns its client and cursor; no consumer group commits are involved.
-func (p *Producer) ReadPartition(ctx context.Context, poll entity.Poll, topicID uuid.UUID, partition int32, visit func(entity.VoteSubmitted) error) (int64, error) {
-	if topicID == uuid.Nil || partition < 0 || int(partition) >= poll.Partitions {
-		return 0, errors.New("invalid topic identity or partition for replay")
-	}
-	reader, err := kgo.NewClient(
-		kgo.SeedBrokers(p.brokers...),
-		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{poll.Topic: {partition: kgo.NewOffset().At(0)}}),
-		kgo.ConsumeResetOffset(kgo.NoResetOffset()),
-	)
-	if err != nil {
-		return 0, err
-	}
-	defer reader.Close()
-
-	var next int64
-	for {
-		batch := reader.PollFetches(ctx)
-		if errs := batch.Errors(); len(errs) != 0 {
-			return 0, errs[0].Err
-		}
-		for _, fetch := range batch {
-			for _, topic := range fetch.Topics {
-				if topic.Topic != poll.Topic || topic.TopicID != topicID {
-					return 0, fmt.Errorf("topic identity changed during replay of %s[%d]", poll.Topic, partition)
-				}
-				if len(topic.Partitions) != 1 || topic.Partitions[0].Partition != partition {
-					return 0, fmt.Errorf("unexpected assignment for %s[%d]", poll.Topic, partition)
-				}
-				part := topic.Partitions[0]
-				if part.LogStartOffset > next {
-					return 0, fmt.Errorf("lost range [%d, %d) in %s[%d]", next, part.LogStartOffset, poll.Topic, partition)
-				}
-				for _, record := range part.Records {
-					// This dedicated delete-only topic has no transactions or
-					// control batches. A hole here means input is missing.
-					if record.Offset != next {
-						return 0, fmt.Errorf("expected offset %d, got %d in %s[%d]", next, record.Offset, poll.Topic, partition)
-					}
-					closed, err := readEvent(poll, record, visit)
-					if err != nil {
-						return 0, fmt.Errorf("%s[%d] at offset %d: %w", poll.Topic, partition, record.Offset, err)
-					}
-					if closed {
-						return record.Offset, nil
-					}
-					next = record.Offset + 1
-				}
-			}
-		}
-	}
-}
-
 func readEvent(poll entity.Poll, record *kgo.Record, visit func(entity.VoteSubmitted) error) (bool, error) {
-	var value voteValue[*int]
+	var value struct {
+		eventHeader
+		ReceivedAt time.Time `json:"received_at"`
+		Choices    []*int    `json:"choices"` // nil отличает JSON null от допустимого ID 0.
+	}
 	if err := json.Unmarshal(record.Value, &value); err != nil {
 		return false, err
 	}
-	if value.PollID == uuid.Nil || value.Version < 1 {
-		return false, errors.New("missing poll identity or version")
+	if value.PollID == uuid.Nil {
+		return false, errors.New("missing poll ID")
 	}
-	if value.PollID != poll.ID || value.Version != poll.Version {
+	if value.PollID != poll.ID {
 		return false, nil
 	}
 	switch value.Type {
@@ -132,7 +84,7 @@ func readEvent(poll entity.Poll, record *kgo.Record, visit func(entity.VoteSubmi
 			return false, errors.New("CLOSE marker contains ballot data")
 		}
 		return true, nil
-	case "": // Ballots written by the intake endpoint have no type field.
+	case "": // При записи бюллетеня API опускает поле type.
 		if len(record.Key) != 32 {
 			return false, errors.New("invalid voter key length")
 		}
@@ -143,12 +95,12 @@ func readEvent(poll entity.Poll, record *kgo.Record, visit func(entity.VoteSubmi
 		choices := make([]int, len(value.Choices))
 		for i, id := range value.Choices {
 			if id == nil {
-				return false, nil // Invalid ballot; the previous valid choice still stands.
+				return false, nil // Бюллетень с null пропускаем целиком, сохраняя предыдущий выбор зрителя.
 			}
 			choices[i] = *id
 		}
 		return false, visit(entity.VoteSubmitted{
-			PollID: value.PollID, Version: value.Version, ReceivedAt: value.ReceivedAt,
+			PollID: value.PollID, ReceivedAt: value.ReceivedAt,
 			VoterKey: key, Choices: choices,
 		})
 	default:

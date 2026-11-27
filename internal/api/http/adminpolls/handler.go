@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/rococo4/televote/internal/api/http/httperror"
 	"github.com/rococo4/televote/internal/entity"
 )
 
@@ -26,9 +27,9 @@ func NewHandler(service Service, token string) http.Handler {
 		if err != nil {
 			var limit *http.MaxBytesError
 			if errors.As(err, &limit) {
-				writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large")
+				httperror.PayloadTooLarge.Write(w)
 			} else {
-				writeError(w, http.StatusBadRequest, "bad_request")
+				httperror.UnreadableBody.Write(w)
 			}
 			return
 		}
@@ -36,9 +37,9 @@ func NewHandler(service Service, token string) http.Handler {
 		if err != nil {
 			var syntax *json.SyntaxError
 			if errors.As(err, &syntax) {
-				writeError(w, http.StatusBadRequest, "bad_request")
+				httperror.InvalidJSON.Write(w)
 			} else {
-				writeError(w, http.StatusUnprocessableEntity, "invalid_poll")
+				httperror.InvalidPoll.Write(w)
 			}
 			return
 		}
@@ -53,7 +54,7 @@ func NewHandler(service Service, token string) http.Handler {
 		raw := r.PathValue("id")
 		id, err := uuid.Parse(raw)
 		if err != nil || len(raw) != 36 {
-			writeError(w, http.StatusBadRequest, "bad_request")
+			httperror.InvalidID.Write(w)
 			return
 		}
 		report, err := service.Results(r.Context(), id)
@@ -70,7 +71,7 @@ func NewHandler(service Service, token string) http.Handler {
 		if token == "" || len(r.Header.Values("Authorization")) != 1 || !strings.EqualFold(scheme, "Bearer") ||
 			subtle.ConstantTimeCompare([]byte(token), []byte(credential)) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+			httperror.Unauthorized.Write(w)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -115,18 +116,14 @@ func decodeCreate(body []byte) (entity.CreatePoll, error) {
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, entity.ErrInvalidPoll):
-		writeError(w, http.StatusUnprocessableEntity, "invalid_poll")
+		httperror.InvalidPoll.Write(w)
 	case errors.Is(err, entity.ErrPollConflict):
-		writeError(w, http.StatusConflict, "poll_conflict")
+		httperror.PollConflict.Write(w)
 	case errors.Is(err, entity.ErrPollNotFound):
-		writeError(w, http.StatusNotFound, "poll_not_found")
+		httperror.PollNotFound.Write(w)
 	default:
-		writeError(w, http.StatusServiceUnavailable, "unavailable")
+		httperror.Internal.Write(w)
 	}
-}
-
-func writeError(w http.ResponseWriter, status int, code string) {
-	writeJSON(w, status, map[string]string{"code": code})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

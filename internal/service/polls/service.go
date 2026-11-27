@@ -52,7 +52,8 @@ func (s *Service) Create(ctx context.Context, spec entity.CreatePoll) (entity.Po
 			return entity.Poll{}, err
 		}
 	}
-	// A previous request may have committed publication but failed before local registration.
+	// При повторном запросе опрос уже может быть опубликован в базе,
+	// хотя эта реплика ещё не успела открыть его для голосования.
 	if err := s.activate(ctx, poll); err != nil {
 		return entity.Poll{}, err
 	}

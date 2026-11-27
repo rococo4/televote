@@ -19,7 +19,7 @@ import (
 type Producer struct {
 	client     *kgo.Client
 	brokers    []string
-	deliveries sync.Map // poll UUID -> *sync.WaitGroup for Kafka delivery callbacks
+	deliveries sync.Map // По UUID опроса находим *sync.WaitGroup для ожидания ответов Kafka.
 }
 
 func New(brokers []string) (*Producer, error) {
@@ -54,24 +54,22 @@ func (p *Producer) Close() {
 }
 
 type eventHeader struct {
-	Type    string    `json:"type,omitempty"`
-	PollID  uuid.UUID `json:"poll_id"`
-	Version int64     `json:"version"`
+	Type   string    `json:"type,omitempty"`
+	PollID uuid.UUID `json:"poll_id"`
 }
 
-// The reader uses *int choices to distinguish JSON null from choice ID 0.
-type voteValue[T int | *int] struct {
+type voteValue struct {
 	eventHeader
 	ReceivedAt time.Time `json:"received_at"`
-	Choices    []T       `json:"choices"`
+	Choices    []int     `json:"choices"`
 }
 
 func (p *Producer) Publish(ctx context.Context, poll entity.Poll, vote entity.VoteSubmitted) error {
 	if poll.Partitions < 1 {
 		return fmt.Errorf("invalid partition count %d for poll %s", poll.Partitions, poll.ID)
 	}
-	value, err := json.Marshal(voteValue[int]{
-		eventHeader: eventHeader{PollID: vote.PollID, Version: vote.Version},
+	value, err := json.Marshal(voteValue{
+		eventHeader: eventHeader{PollID: vote.PollID},
 		ReceivedAt:  vote.ReceivedAt,
 		Choices:     vote.Choices,
 	})
@@ -101,7 +99,8 @@ func (p *Producer) Publish(ctx context.Context, poll entity.Poll, vote entity.Vo
 	case err := <-result:
 		return err
 	case <-ctx.Done():
-		// A late ACK is still possible. Flush waits for outstanding sends on shutdown.
+		// Kafka может подтвердить запись уже после тайм-аута. Эту отправку
+		// продолжает учитывать WaitVotes, а при остановке сервиса — Flush.
 		return ctx.Err()
 	}
 }
@@ -110,8 +109,8 @@ func voterPartition(key [32]byte, partitions int) int32 {
 	return int32(binary.BigEndian.Uint64(key[:8]) % uint64(partitions))
 }
 
-// WaitVotes is called after admission for this poll is sealed and its
-// handlers have finished. An HTTP timeout may precede the delivery callback.
+// WaitVotes вызывают после закрытия опроса и завершения его HTTP-обработчиков.
+// Тогда список отправок уже полон, но Kafka ещё может подтверждать записи.
 func (p *Producer) WaitVotes(ctx context.Context, pollID uuid.UUID) error {
 	active, ok := p.deliveries.Load(pollID)
 	if !ok {

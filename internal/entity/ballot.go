@@ -13,7 +13,6 @@ type Ballot struct {
 
 type VoteSubmitted struct {
 	PollID     uuid.UUID
-	Version    int64
 	ReceivedAt time.Time
 	VoterKey   [32]byte
 	Choices    []int

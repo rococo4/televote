@@ -2,35 +2,67 @@ package votes
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/rococo4/televote/internal/api/http/httperror"
 	"github.com/rococo4/televote/internal/entity"
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
 const maxBodyBytes = 1 << 20
+const voterCookieName = "televote_voter"
 
 func NewHandler(service *voting.Service, loadPoll func(context.Context, uuid.UUID) error) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/polls/{id}/votes", func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		pollID, err := uuid.Parse(id)
-		if err != nil || len(id) != 36 {
-			writeError(w, http.StatusBadRequest, "bad_request")
+	mux.HandleFunc("GET /api/polls/{id}", pollEndpoint("", func(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+		poll, err := service.PublicPoll(id)
+		if errors.Is(err, voting.ErrPollNotFound) && loadPoll != nil {
+			if err = loadPoll(r.Context(), id); err == nil {
+				poll, err = service.PublicPoll(id)
+			}
+		}
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		if _, ok := voterToken(r); !ok && time.Now().Before(poll.ClosesAt) {
+			var identity [16]byte
+			rand.Read(identity[:])
+			http.SetCookie(w, &http.Cookie{
+				Name: voterCookieName, Value: hex.EncodeToString(identity[:]),
+				Path: "/api/polls/" + id.String(), HttpOnly: true,
+				SameSite: http.SameSiteLaxMode, Secure: secureCookie(r),
+				// HTTP-дата имеет точность до секунды. Cookie нужна до конца голосования.
+				Expires: poll.ClosesAt.Add(time.Second - time.Nanosecond).UTC().Truncate(time.Second),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(poll)
+	}))
+	mux.HandleFunc("POST /api/polls/{id}/votes", pollEndpoint("/votes", func(w http.ResponseWriter, r *http.Request, pollID uuid.UUID) {
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/json" {
+			httperror.UnsupportedMediaType.Write(w)
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
 			var limit *http.MaxBytesError
 			if errors.As(err, &limit) {
-				writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large")
+				httperror.PayloadTooLarge.Write(w)
 			} else {
-				writeError(w, http.StatusBadRequest, "bad_request")
+				httperror.UnreadableBody.Write(w)
 			}
 			return
 		}
@@ -45,13 +77,18 @@ func NewHandler(service *voting.Service, loadPoll func(context.Context, uuid.UUI
 			return
 		}
 		defer admission.Finish()
-		token, ballot, err := decodeBallot(body)
+		token, ok := voterToken(r)
+		if !ok {
+			httperror.VoterCookieRequired.Write(w)
+			return
+		}
+		ballot, err := decodeBallot(body)
 		if err != nil {
 			var syntax *json.SyntaxError
 			if errors.As(err, &syntax) {
-				writeError(w, http.StatusBadRequest, "bad_request")
+				httperror.InvalidJSON.Write(w)
 			} else {
-				writeError(w, http.StatusUnprocessableEntity, "invalid_ballot")
+				httperror.InvalidBallot.Write(w)
 			}
 			return
 		}
@@ -62,58 +99,86 @@ func NewHandler(service *voting.Service, loadPoll func(context.Context, uuid.UUI
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = io.WriteString(w, `{"status":"accepted"}`)
-	})
+	}))
 	return mux
 }
 
-func decodeBallot(body []byte) ([16]byte, entity.Ballot, error) {
+func pollEndpoint(suffix string, serve func(http.ResponseWriter, *http.Request, uuid.UUID)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "private, no-store")
+		raw := r.PathValue("id")
+		id, err := uuid.Parse(raw)
+		if err != nil || len(raw) != 36 {
+			httperror.InvalidID.Write(w)
+			return
+		}
+		// Браузер сравнивает пути cookie посимвольно. У одного опроса должен быть
+		// один путь, в том числе при переходе по ссылке с UUID в верхнем регистре.
+		canonical := "/api/polls/" + id.String() + suffix
+		if r.URL.EscapedPath() != canonical {
+			if r.URL.RawQuery != "" {
+				canonical += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, canonical, http.StatusTemporaryRedirect)
+			return
+		}
+		serve(w, r, id)
+	}
+}
+
+func voterToken(r *http.Request) ([16]byte, bool) {
 	var token [16]byte
+	c, err := r.Cookie(voterCookieName)
+	if err != nil || len(c.Value) != hex.EncodedLen(len(token)) {
+		return token, false
+	}
+	_, err = hex.Decode(token[:], []byte(c.Value))
+	return token, err == nil
+}
+
+func secureCookie(r *http.Request) bool {
+	host := (&url.URL{Host: r.Host}).Hostname()
+	// За балансировщиком соединение с Go может быть обычным HTTP.
+	// Исключение нужно только для локального запуска без TLS.
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
+		!(strings.EqualFold(host, "localhost") || net.ParseIP(host).IsLoopback())
+}
+
+func decodeBallot(body []byte) (entity.Ballot, error) {
 	var ballot entity.Ballot
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return token, ballot, err
+		return ballot, err
 	}
-	var encoded string
-	if len(fields) != 2 || json.Unmarshal(fields["token"], &encoded) != nil || len(encoded) != hex.EncodedLen(len(token)) {
-		return token, ballot, entity.ErrInvalidBallot
+	if len(fields) != 1 {
+		return ballot, entity.ErrInvalidBallot
 	}
-	if _, err := hex.Decode(token[:], []byte(encoded)); err != nil {
-		return token, ballot, entity.ErrInvalidBallot
-	}
-	// A JSON null must not be decoded as choice ID zero.
+	// Указатель позволяет отклонить null и при этом принять вариант с ID 0.
 	var choices []*int
 	if err := json.Unmarshal(fields["choices"], &choices); err != nil || len(choices) == 0 {
-		return token, ballot, entity.ErrInvalidBallot
+		return ballot, entity.ErrInvalidBallot
 	}
 	ballot.Choices = make([]int, len(choices))
 	for i, choice := range choices {
 		if choice == nil {
-			return token, ballot, entity.ErrInvalidBallot
+			return ballot, entity.ErrInvalidBallot
 		}
 		ballot.Choices[i] = *choice
 	}
-	return token, ballot, nil
+	return ballot, nil
 }
 
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, voting.ErrUnavailable):
-		writeError(w, http.StatusServiceUnavailable, "unavailable")
 	case errors.Is(err, voting.ErrPollNotFound):
-		writeError(w, http.StatusNotFound, "poll_not_found")
+		httperror.PollNotFound.Write(w)
 	case errors.Is(err, entity.ErrNotOpen):
-		writeError(w, http.StatusConflict, "not_open")
+		httperror.NotOpen.Write(w)
 	case errors.Is(err, entity.ErrClosed):
-		writeError(w, http.StatusGone, "closed")
+		httperror.Closed.Write(w)
 	case errors.Is(err, entity.ErrInvalidBallot):
-		writeError(w, http.StatusUnprocessableEntity, "invalid_ballot")
+		httperror.InvalidBallot.Write(w)
 	default:
-		writeError(w, http.StatusInternalServerError, "internal_error")
+		httperror.Internal.Write(w)
 	}
-}
-
-func writeError(w http.ResponseWriter, status int, code string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"code": code})
 }

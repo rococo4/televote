@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -40,13 +41,28 @@ func New(polls []entity.Poll, publisher Publisher, now func() time.Time) *Servic
 	snapshot := make(map[uuid.UUID]*pollIntake, len(polls))
 	for _, poll := range polls {
 		poll.Choices = maps.Clone(poll.Choices)
+		poll.Options = slices.Clone(poll.Options)
 		snapshot[poll.ID] = &pollIntake{poll: poll}
 	}
 	return &Service{polls: snapshot, publisher: publisher, now: now}
 }
 
-// Register publishes an immutable intake snapshot after this process has checked
-// writer membership. Re-registration must preserve outstanding admissions.
+func (s *Service) PublicPoll(id uuid.UUID) (entity.PublicPoll, error) {
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	intake, ok := s.polls[id]
+	if !ok {
+		return entity.PublicPoll{}, ErrPollNotFound
+	}
+	p := intake.poll
+	return entity.PublicPoll{
+		ID: p.ID, Question: p.Question, Choices: slices.Clone(p.Options),
+		OpensAt: p.OpensAt, ClosesAt: p.ClosesAt, MinChoices: p.MinChoices, MaxChoices: p.MaxChoices,
+	}, nil
+}
+
+// Register сохраняет правила опроса на этой реплике. Принимать голоса могут
+// только зарегистрированные писатели. При повторном вызове сохраняем счётчик активных запросов.
 func (s *Service) Register(p entity.Poll, joined bool) error {
 	s.gate.Lock()
 	defer s.gate.Unlock()
@@ -57,6 +73,7 @@ func (s *Service) Register(p entity.Poll, joined bool) error {
 		return nil
 	}
 	p.Choices = maps.Clone(p.Choices)
+	p.Options = slices.Clone(p.Options)
 	intake := &pollIntake{poll: p}
 	if !joined {
 		intake.sealed = make(chan struct{})
@@ -72,13 +89,12 @@ func (s *Service) Submit(ctx context.Context, a *Admission, token [16]byte, ball
 	}
 	event := entity.VoteSubmitted{
 		PollID:     a.poll.ID,
-		Version:    a.poll.Version,
 		ReceivedAt: a.receivedAt,
 		VoterKey:   entity.VoterKey(a.poll.ID, token),
 		Choices:    ballot.Choices,
 	}
-	// A disconnected browser can retry. Finish the registered publication under
-	// a server-owned deadline so shutdown cannot overtake it.
+	// Если зритель закроет вкладку, сервер всё равно дождётся результата
+	// отправки в Kafka в пределах собственного тайм-аута.
 	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := s.publisher.Publish(publishCtx, a.poll, event); err != nil {

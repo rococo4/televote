@@ -93,25 +93,26 @@ func TestAdminErrors(t *testing.T) {
 		name, method, path, body string
 		err                      error
 		status                   int
-		code                     string
+		code, message            string
 	}{
-		{"malformed JSON", "POST", "/admin/polls", draftJSON + "{}", nil, 400, "bad_request"},
-		{"missing fields", "POST", "/admin/polls", "{}", nil, 422, "invalid_poll"},
-		{"unknown field", "POST", "/admin/polls", strings.Replace(draftJSON, "{", `{"extra":1,`, 1), nil, 422, "invalid_poll"},
-		{"missing timestamp", "POST", "/admin/polls", strings.Replace(draftJSON, `"2027-01-15T17:00:00Z"`, "null", 1), nil, 422, "invalid_poll"},
-		{"invalid id", "POST", "/admin/polls", strings.Replace(draftJSON, "{", `{"id":"bad",`, 1), nil, 422, "invalid_poll"},
-		{"oversize", "POST", "/admin/polls", strings.Repeat(" ", 1<<20+1), nil, 413, "payload_too_large"},
-		{"business rule", "POST", "/admin/polls", draftJSON, entity.ErrInvalidPoll, 422, "invalid_poll"},
-		{"conflicting id", "POST", "/admin/polls", draftJSON, fmt.Errorf("create: %w", entity.ErrPollConflict), 409, "poll_conflict"},
-		{"malformed path", "GET", "/admin/polls/bad/results", "", nil, 400, "bad_request"},
-		{"unknown poll", "GET", results, "", entity.ErrPollNotFound, 404, "poll_not_found"},
-		{"dependency failure", "GET", results, "", errors.New("database unavailable"), 503, "unavailable"},
+		{"malformed JSON", "POST", "/admin/polls", draftJSON + "{}", nil, 400, "bad_request", "Некорректный JSON."},
+		{"missing fields", "POST", "/admin/polls", "{}", nil, 400, "bad_request", "Некорректные параметры опроса."},
+		{"unknown field", "POST", "/admin/polls", strings.Replace(draftJSON, "{", `{"extra":1,`, 1), nil, 400, "bad_request", "Некорректные параметры опроса."},
+		{"missing timestamp", "POST", "/admin/polls", strings.Replace(draftJSON, `"2027-01-15T17:00:00Z"`, "null", 1), nil, 400, "bad_request", "Некорректные параметры опроса."},
+		{"invalid id", "POST", "/admin/polls", strings.Replace(draftJSON, "{", `{"id":"bad",`, 1), nil, 400, "bad_request", "Некорректные параметры опроса."},
+		{"oversize", "POST", "/admin/polls", strings.Repeat(" ", 1<<20+1), nil, 400, "bad_request", "Тело запроса превышает 1 МиБ."},
+		{"business rule", "POST", "/admin/polls", draftJSON, entity.ErrInvalidPoll, 400, "bad_request", "Некорректные параметры опроса."},
+		{"conflicting id", "POST", "/admin/polls", draftJSON, fmt.Errorf("create: %w", entity.ErrPollConflict), 400, "bad_request", "Этот ID занят опросом с другими параметрами."},
+		{"malformed path", "GET", "/admin/polls/bad/results", "", nil, 400, "bad_request", "ID опроса должен быть UUID."},
+		{"unknown poll", "GET", results, "", entity.ErrPollNotFound, 404, "poll_not_found", "Опрос не найден."},
+		{"creation failure", "POST", "/admin/polls", draftJSON, errors.New("database unavailable"), 500, "internal_error", "Внутренняя ошибка сервера."},
+		{"dependency failure", "GET", results, "", errors.New("database unavailable"), 500, "internal_error", "Внутренняя ошибка сервера."},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &serviceStub{err: tc.err}
 			w := request(NewHandler(s, "secret"), tc.method, tc.path, "Bearer secret", tc.body)
-			var problem struct{ Code string }
-			if w.Code != tc.status || json.Unmarshal(w.Body.Bytes(), &problem) != nil || problem.Code != tc.code {
+			var problem struct{ Code, Message string }
+			if w.Code != tc.status || json.Unmarshal(w.Body.Bytes(), &problem) != nil || problem.Code != tc.code || problem.Message != tc.message {
 				t.Fatalf("got %d %s, want %d %s", w.Code, w.Body.String(), tc.status, tc.code)
 			}
 			if (tc.err == nil) != (s.calls == 0) {

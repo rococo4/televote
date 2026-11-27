@@ -14,8 +14,9 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-// EnsureTopic provisions a dedicated delete-only journal. A retry may find the
-// topic created by an earlier request whose database publication did not commit.
+// EnsureTopic создаёт для опроса отдельный топик с политикой очистки delete.
+// Если предыдущая попытка создала топик, но не опубликовала опрос в базе,
+// проверяем настройки существующего топика перед повторным использованием.
 func (p *Producer) EnsureTopic(ctx context.Context, poll entity.Poll) (uuid.UUID, error) {
 	if poll.Partitions < 1 || poll.Partitions > math.MaxInt32 {
 		return uuid.Nil, fmt.Errorf("invalid number of Kafka partitions: %d", poll.Partitions)
@@ -37,7 +38,7 @@ func (p *Producer) EnsureTopic(ctx context.Context, poll entity.Poll) (uuid.UUID
 	if createErr != nil && !errors.Is(createErr, kerr.TopicAlreadyExists) {
 		return uuid.Nil, fmt.Errorf("create topic %s: %w", poll.Topic, createErr)
 	}
-	// A follower may briefly lack the controller's new topic metadata.
+	// После создания топика сведения о его партициях могут дойти до брокера с задержкой.
 	for attempt := 0; ; attempt++ {
 		var id uuid.UUID
 		id, err = p.TopicID(ctx, poll)

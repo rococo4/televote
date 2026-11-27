@@ -20,7 +20,7 @@ func (f publishFunc) Publish(ctx context.Context, p entity.Poll, e entity.VoteSu
 func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 	opens := time.Unix(100, 0).UTC()
 	p := entity.Poll{
-		ID: uuid.New(), Version: 5, OpensAt: opens, ClosesAt: opens.Add(time.Minute),
+		ID: uuid.New(), OpensAt: opens, ClosesAt: opens.Add(time.Minute),
 		Choices: map[int]struct{}{2: {}}, MinChoices: 1, MaxChoices: 1,
 	}
 	started := make(chan entity.VoteSubmitted, 1)
@@ -42,14 +42,14 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // The browser disconnected after sending the body.
+	cancel() // Зритель закрыл вкладку сразу после отправки бюллетеня.
 	done := make(chan error, 1)
 	go func() {
 		defer a.Finish()
 		done <- s.Submit(ctx, a, [16]byte{1}, entity.Ballot{Choices: []int{2}})
 	}()
 	event := <-started
-	if !event.ReceivedAt.Equal(p.ClosesAt.Add(-100*time.Millisecond)) || event.PollID != p.ID || event.Version != p.Version {
+	if !event.ReceivedAt.Equal(p.ClosesAt.Add(-100*time.Millisecond)) || event.PollID != p.ID {
 		t.Fatalf("wrong event metadata: %+v", event)
 	}
 	elapsed.Store(int64(60*time.Second + 100*time.Millisecond))
@@ -65,7 +65,7 @@ func TestAdmittedVoteFinishesAfterClose(t *testing.T) {
 		t.Fatal("reported drain before the admitted vote finished")
 	default:
 	}
-	elapsed.Store(int64(59 * time.Second)) // A clock correction cannot reopen the sealed poll.
+	elapsed.Store(int64(59 * time.Second)) // Перевод часов назад не должен снова открыть опрос.
 	if _, err := s.Begin(p.ID); !errors.Is(err, entity.ErrClosed) {
 		t.Fatalf("admission after sealing: got %v", err)
 	}

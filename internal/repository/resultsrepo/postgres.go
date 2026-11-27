@@ -13,14 +13,16 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-// AlgorithmVersion identifies the rule that counts the last admissible ballot in partition order.
-const AlgorithmVersion = 1
-
 //go:embed queries/save_partition.sql
 var savePartitionSQL string
 
 //go:embed queries/finalize.sql
 var finalizeSQL string
+
+// Executor позволяет вызвать BindTopic и через пул подключений, и внутри транзакции.
+type Executor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -32,26 +34,25 @@ func (r *Repository) Bind(ctx context.Context, p entity.Poll, topicID uuid.UUID)
 	return BindTopic(ctx, r.pool, p, topicID)
 }
 
-// BindTopic accepts either a pool or the transaction publishing a new poll.
-func BindTopic(ctx context.Context, db interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}, p entity.Poll, topicID uuid.UUID) error {
+// BindTopic закрепляет за опросом конкретный топик Kafka.
+// При публикации эта привязка сохраняется в той же транзакции, что и сам опрос.
+func BindTopic(ctx context.Context, db Executor, p entity.Poll, topicID uuid.UUID) error {
 	if topicID == uuid.Nil {
 		return errors.New("empty Kafka topic ID")
 	}
 	tag, err := db.Exec(ctx, `
-		INSERT INTO poll_count_manifests AS m (poll_id, version, algorithm, topic, topic_id, partitions)
-		SELECT id, version, $3, topic, $4, partitions FROM polls
-		WHERE id = $1 AND version = $2 AND topic = $5 AND partitions = $6
-		ON CONFLICT (poll_id, version, algorithm) DO UPDATE
+		INSERT INTO poll_count_manifests AS m (poll_id, topic, topic_id, partitions)
+		SELECT id, topic, $2, partitions FROM polls
+		WHERE id = $1 AND topic = $3 AND partitions = $4
+		ON CONFLICT (poll_id) DO UPDATE
 		    SET topic_id = m.topic_id
 		    WHERE (m.topic, m.topic_id, m.partitions) = (excluded.topic, excluded.topic_id, excluded.partitions)`,
-		p.ID, p.Version, AlgorithmVersion, topicID, p.Topic, p.Partitions)
+		p.ID, topicID, p.Topic, p.Partitions)
 	if err != nil {
 		return fmt.Errorf("bind Kafka topic for poll %s: %w", p.ID, err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("poll %s version %d configuration or bound Kafka topic changed", p.ID, p.Version)
+		return fmt.Errorf("poll %s configuration or bound Kafka topic changed", p.ID)
 	}
 	return nil
 }
@@ -62,8 +63,8 @@ func (r *Repository) BoundTopic(ctx context.Context, p entity.Poll) (uuid.UUID, 
 	var partitions int
 	err := r.pool.QueryRow(ctx, `
 		SELECT topic_id, topic, partitions FROM poll_count_manifests
-		WHERE poll_id = $1 AND version = $2 AND algorithm = $3`,
-		p.ID, p.Version, AlgorithmVersion).Scan(&id, &name, &partitions)
+		WHERE poll_id = $1`,
+		p.ID).Scan(&id, &name, &partitions)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, nil
 	}
@@ -71,7 +72,7 @@ func (r *Repository) BoundTopic(ctx context.Context, p entity.Poll) (uuid.UUID, 
 		return uuid.Nil, false, fmt.Errorf("read bound Kafka topic: %w", err)
 	}
 	if name != p.Topic || partitions != p.Partitions {
-		return uuid.Nil, false, fmt.Errorf("poll %s version %d differs from its manifest", p.ID, p.Version)
+		return uuid.Nil, false, fmt.Errorf("poll %s differs from its manifest", p.ID)
 	}
 	return id, true, nil
 }
@@ -81,10 +82,10 @@ func (r *Repository) Progress(ctx context.Context, p entity.Poll) (bool, map[int
 	var partitions []int32
 	err := r.pool.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM poll_results
-		               WHERE poll_id = $1 AND version = $2 AND algorithm = $3),
+		               WHERE poll_id = $1),
 		       ARRAY(SELECT partition_id FROM poll_partition_results
-		             WHERE poll_id = $1 AND version = $2 AND algorithm = $3)`,
-		p.ID, p.Version, AlgorithmVersion).Scan(&final, &partitions)
+		             WHERE poll_id = $1)`,
+		p.ID).Scan(&final, &partitions)
 	if err != nil {
 		return false, nil, fmt.Errorf("load counting progress: %w", err)
 	}
@@ -96,6 +97,9 @@ func (r *Repository) Progress(ctx context.Context, p entity.Poll) (bool, map[int
 }
 
 func (r *Repository) SavePartition(ctx context.Context, p entity.Poll, result entity.PartitionResult) error {
+	if result.Ballots < 0 || result.Ballots > result.EndOffset {
+		return fmt.Errorf("invalid partition result: end_offset=%d, ballots=%d", result.EndOffset, result.Ballots)
+	}
 	if len(result.Counts) != len(p.Choices) {
 		return errors.New("partition result has a different set of choices")
 	}
@@ -105,8 +109,8 @@ func (r *Repository) SavePartition(ctx context.Context, p entity.Poll, result en
 			return fmt.Errorf("invalid count for choice %d", id)
 		}
 	}
-	tag, err := r.pool.Exec(ctx, savePartitionSQL, p.ID, p.Version, AlgorithmVersion, result.Partition,
-		result.StartOffset, result.EndOffset, result.Ballots, result.Counts)
+	tag, err := r.pool.Exec(ctx, savePartitionSQL, p.ID, result.Partition,
+		result.EndOffset, result.Ballots, result.Counts)
 	if err != nil {
 		return fmt.Errorf("save result for partition %d: %w", result.Partition, err)
 	}
@@ -117,12 +121,12 @@ func (r *Repository) SavePartition(ctx context.Context, p entity.Poll, result en
 }
 
 func (r *Repository) Finalize(ctx context.Context, p entity.Poll) error {
-	tag, err := r.pool.Exec(ctx, finalizeSQL, p.ID, p.Version, AlgorithmVersion)
+	tag, err := r.pool.Exec(ctx, finalizeSQL, p.ID)
 	if err != nil {
 		return fmt.Errorf("save final result for poll %s: %w", p.ID, err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("poll %s version %d has incomplete or conflicting partition results", p.ID, p.Version)
+		return fmt.Errorf("poll %s has incomplete or conflicting partition results", p.ID)
 	}
 	return nil
 }

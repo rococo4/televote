@@ -2,8 +2,8 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,21 +11,10 @@ import (
 	"github.com/rococo4/televote/internal/service/voting"
 )
 
-// RunCounting finishes a fixed snapshot. ServePolls is the long-running scheduler.
-func (h *Handler) RunCounting(ctx context.Context) {
-	var jobs sync.WaitGroup
-	h.mu.RLock()
-	for _, local := range h.polls {
-		jobs.Go(func() { h.finishPoll(ctx, local.poll) })
-	}
-	h.mu.RUnlock()
-	jobs.Wait()
-}
-
-// CountClosedPoll may be called concurrently on multiple replicas. Every
-// replica must observe the same durable decision before appending a marker.
-func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
-	local, ok := h.lookup(id)
+// CountClosedPoll может работать на нескольких репликах одновременно. Каждая ждёт,
+// пока в PostgreSQL появится общее решение о закрытии, и только тогда ставит CLOSE в Kafka.
+func (a *App) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
+	local, ok := a.lookup(id)
 	if !ok {
 		return voting.ErrPollNotFound
 	}
@@ -33,42 +22,50 @@ func (h *Handler) CountClosedPoll(ctx context.Context, id uuid.UUID) error {
 	if time.Now().Before(p.ClosesAt) {
 		return voting.ErrStillOpen
 	}
-	handlersDone, err := h.voting.Seal(id)
+	handlersDone, err := a.voting.Seal(id)
 	if err != nil {
 		return err
 	}
 	if local.joined {
-		if err := h.drainWriter(ctx, local, handlersDone); err != nil {
+		if err := a.drainWriter(ctx, local, handlersDone); err != nil {
 			return err
 		}
 	} else {
-		// On restart an older release may already have finalized this poll.
-		// Preserve that result without inventing a retrospective timeout.
-		if final, err := h.counting.IsFinal(ctx, p); err != nil || final {
+		// У опросов, подсчитанных до введения учёта реплик, уже есть итог.
+		// При перезапуске такой опрос можно пропустить.
+		if final, err := a.counting.IsFinal(ctx, p); err != nil || final {
 			return err
 		}
 	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		ready, err := h.closures.Decide(ctx, p)
-		if err != nil {
-			return err
-		}
-		if ready {
-			return h.counting.Count(ctx, p)
-		}
+	ready, cutoff, err := a.closures.Decide(ctx, p)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		// Последний писатель сам начнёт закрытие. В общий срок проверим,
+		// успел ли он закончить или нужно продолжить за него.
+		timer := time.NewTimer(time.Until(cutoff))
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
+		}
+		ready, _, err = a.closures.Decide(ctx, p)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			// Если часы пода опережают PostgreSQL, finishPoll повторит попытку с задержкой.
+			return fmt.Errorf("poll %s still waiting for close decision at %s", id, cutoff)
 		}
 	}
+	return a.counting.Count(ctx, p)
 }
 
-func (h *Handler) drainWriter(ctx context.Context, local localPoll, handlersDone <-chan struct{}) error {
-	// Apply one absolute budget to both HTTP handlers and outstanding Kafka
-	// callbacks. A stuck send on the last surviving scheduler must not stall it.
+func (a *App) drainWriter(ctx context.Context, local localPoll, handlersDone <-chan struct{}) error {
+	// До одного и того же срока ждём завершения HTTP-запросов и подтверждений Kafka.
+	// Даже если отправка зависнет на последней живой реплике, опрос можно будет закрыть.
 	drainCtx, cancel := context.WithDeadline(ctx, local.drainDeadline)
 	defer cancel()
 	select {
@@ -76,18 +73,19 @@ func (h *Handler) drainWriter(ctx context.Context, local localPoll, handlersDone
 		return ctx.Err()
 	case <-handlersDone:
 	}
-	err := h.journal.WaitVotes(drainCtx, local.poll.ID)
+	err := a.journal.WaitVotes(drainCtx, local.poll.ID)
 	if drainCtx.Err() != nil {
-		// The grace deadline permits a timeout decision. Caller cancellation does not.
+		// Когда истёк срок ожидания, возвращаем nil, чтобы Decide мог закрыть опрос
+		// по тайм-ауту. При остановке самого сервиса возвращаем ошибку отмены.
 		return ctx.Err()
 	}
 	if err != nil {
 		return err
 	}
-	return h.closures.Drain(ctx, local.poll, h.writerID)
+	return a.closures.Drain(ctx, local.poll, a.writerID)
 }
 
-func (h *Handler) finishPoll(ctx context.Context, p entity.Poll) {
+func (a *App) finishPoll(ctx context.Context, p entity.Poll) {
 	timer := time.NewTimer(time.Until(p.ClosesAt))
 	defer timer.Stop()
 	backoff := time.Second
@@ -97,11 +95,11 @@ func (h *Handler) finishPoll(ctx context.Context, p entity.Poll) {
 			return
 		case <-timer.C:
 		}
-		err := h.CountClosedPoll(ctx, p.ID)
+		err := a.CountClosedPoll(ctx, p.ID)
 		if err == nil || ctx.Err() != nil {
 			return
 		}
-		log.Printf("count poll %s version %d: %v; retry in %s", p.ID, p.Version, err, backoff)
+		log.Printf("count poll %s: %v; retry in %s", p.ID, err, backoff)
 		timer.Reset(backoff)
 		backoff = min(backoff*2, time.Minute)
 	}

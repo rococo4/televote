@@ -14,8 +14,9 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// A partial creation can leave a topic without a published poll. Recovery
-// accepts its original journal only when it matches the replay assumptions.
+// Сбой между созданием топика и публикацией опроса оставляет топик в Kafka.
+// При повторе проверяем число партиций и политику delete. Уплотнение журнала
+// по ключу зрителя оставило бы пропуски в последовательности записей.
 func TestEnsureExistingTopic(t *testing.T) {
 	brokers := os.Getenv("KAFKA_BROKERS")
 	if brokers == "" {

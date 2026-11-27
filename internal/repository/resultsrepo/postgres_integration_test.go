@@ -14,8 +14,8 @@ import (
 	"github.com/rococo4/televote/internal/repository/resultsrepo"
 )
 
-// A result is publishable only when every partition, including an empty one,
-// agrees with its durable checkpoint. A failed/retried write cannot replace it.
+// Для публикации нужны итоги всех партиций, в том числе пустых.
+// Повторная запись допустима только при совпадении с уже сохранённым итогом.
 func TestPartitionCheckpoints(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
@@ -28,11 +28,11 @@ func TestPartitionCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	p := entity.Poll{ID: uuid.New(), Version: 3, Partitions: 2, Choices: map[int]struct{}{1: {}, 2: {}}}
+	p := entity.Poll{ID: uuid.New(), Partitions: 2, Choices: map[int]struct{}{1: {}, 2: {}}}
 	p.Topic = "checkpoint-" + p.ID.String()
 	_, err = pool.Exec(ctx, `
-		INSERT INTO polls (id, version, question, opens_at, closes_at, min_choices, max_choices, topic, partitions)
-		VALUES ($1,$2,'A/B',now(),now() + interval '1 hour',1,1,$3,$4)`, p.ID, p.Version, p.Topic, p.Partitions)
+		INSERT INTO polls (id, question, opens_at, closes_at, min_choices, max_choices, topic, partitions)
+		VALUES ($1,'A/B',now(),now() + interval '1 hour',1,1,$2,$3)`, p.ID, p.Topic, p.Partitions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,10 +51,20 @@ func TestPartitionCheckpoints(t *testing.T) {
 		t.Fatal("replaced a bound topic UUID")
 	}
 	first := entity.PartitionResult{Partition: 0, EndOffset: 3, Ballots: 2, Counts: map[int]int64{1: 0, 2: 2}}
+	excessBallots := first
+	excessBallots.Ballots = first.EndOffset + 1
+	if err := repo.SavePartition(ctx, p, excessBallots); err == nil {
+		t.Fatal("saved more ballots than records before CLOSE")
+	}
 	for range 2 {
 		if err := repo.SavePartition(ctx, p, first); err != nil {
 			t.Fatal(err)
 		}
+	}
+	differentEnd := first
+	differentEnd.EndOffset++
+	if err := repo.SavePartition(ctx, p, differentEnd); err == nil {
+		t.Fatal("accepted a different CLOSE offset for a saved partition")
 	}
 	if err := repo.Finalize(ctx, p); err == nil {
 		t.Fatal("published final before the empty partition finished")
@@ -79,8 +89,8 @@ func TestPartitionCheckpoints(t *testing.T) {
 	var ballots, a, b int64
 	if err := pool.QueryRow(ctx, `
 		SELECT ballots, (counts->>'1')::bigint, (counts->>'2')::bigint
-		FROM poll_results WHERE poll_id = $1 AND version = $2 AND algorithm = 1`,
-		p.ID, p.Version).Scan(&ballots, &a, &b); err != nil {
+		FROM poll_results WHERE poll_id = $1`,
+		p.ID).Scan(&ballots, &a, &b); err != nil {
 		t.Fatal(err)
 	}
 	if ballots != 2 || a != 0 || b != 2 {

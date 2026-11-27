@@ -2,22 +2,20 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS polls (
     id          uuid PRIMARY KEY,
-    version     bigint NOT NULL DEFAULT 1 CHECK (version > 0),
-    question    text NOT NULL CHECK (question <> ''),
+    question    text NOT NULL,
     opens_at    timestamptz NOT NULL,
     closes_at   timestamptz NOT NULL,
-    min_choices integer NOT NULL CHECK (min_choices >= 1),
-    max_choices integer NOT NULL CHECK (max_choices >= min_choices),
-    topic       text NOT NULL UNIQUE CHECK (topic <> ''),
-    partitions  integer NOT NULL CHECK (partitions >= 1),
-    published   boolean NOT NULL DEFAULT false,
-    CHECK (opens_at < closes_at)
+    min_choices integer NOT NULL,
+    max_choices integer NOT NULL,
+    topic       text NOT NULL UNIQUE,
+    partitions  integer NOT NULL,
+    published   boolean NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS poll_choices (
     poll_id uuid NOT NULL REFERENCES polls (id) ON DELETE CASCADE,
     id      integer NOT NULL,
-    label   text NOT NULL CHECK (label <> ''),
+    label   text NOT NULL,
     PRIMARY KEY (poll_id, id)
 );
 

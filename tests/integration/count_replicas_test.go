@@ -5,7 +5,6 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,13 +27,13 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 		a, b   int64
 	}{
 		{"all_writers_drained", "drained", http.StatusAccepted, 0, 1},
-		{"missing_writer_and_late_delivery", "timeout", http.StatusServiceUnavailable, 1, 0},
+		{"missing_writer_and_late_delivery", "timeout", http.StatusInternalServerError, 1, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			// The first writer fixes the grace period for this generation.
-			// A differently configured replica must use the same PG cutoff.
+			// Первая реплика сохраняет срок ожидания для этого опроса в PostgreSQL.
+			// Вторая должна взять этот же срок, хотя в её настройках указано другое значение.
 			const pollGrace = 2 * time.Second
 			f := newPollFixture(t, ctx, 3*time.Second, pollGrace, 1, []string{"A", "B"})
 			p := f.poll
@@ -44,30 +43,37 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 			}
 			t.Cleanup(writer.Close)
 			gate := &delayedJournal{Producer: writer, ctx: ctx, admitted: make(chan struct{}), release: make(chan struct{}), delivered: make(chan struct{})}
-			second, err := app.NewHandler(ctx, f.pool, gate, 12*time.Second, app.AdminConfig{Partitions: 4})
+			second, err := app.New(ctx, f.pool, gate, 12*time.Second, app.AdminConfig{Partitions: 4})
 			if err != nil {
 				t.Fatal(err)
 			}
 			server := httptest.NewServer(second)
 			t.Cleanup(server.Close)
 
-			// Same viewer: the result changes from A to B only if the second
-			// replica appends its admitted vote before partition 0's first CLOSE.
+			// Один зритель меняет ответ с A на B через другую реплику. В итог попадёт B,
+			// только если запись дойдёт до партиции 0 раньше первого CLOSE.
 			token := tokenForPartition(p, 0)
 			path := "/api/polls/" + p.ID.String() + "/votes"
 			postVote(t, ctx, f.server.Client(), f.server.URL+path, token, 1)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+path,
-				strings.NewReader(fmt.Sprintf(`{"token":%q,"choices":[2]}`, token)))
+				strings.NewReader(`{"choices":[2]}`))
 			if err != nil {
 				t.Fatal(err)
 			}
 			req.Header.Set("Content-Type", "application/json")
+			req.AddCookie(&http.Cookie{Name: voterCookie, Value: token})
 			status := make(chan int, 1)
 			go func() {
 				res, err := server.Client().Do(req)
 				if err != nil {
 					status <- 0
 					return
+				}
+				if res.StatusCode == http.StatusInternalServerError {
+					var reply struct{ Code, Message string }
+					if err := json.NewDecoder(res.Body).Decode(&reply); err != nil || reply.Code != "internal_error" || strings.TrimSpace(reply.Message) == "" {
+						t.Errorf("unexpected HTTP 500 body: %+v, decode error: %v", reply, err)
+					}
 				}
 				res.Body.Close()
 				status <- res.StatusCode
@@ -80,32 +86,30 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 				t.Fatal(ctx.Err())
 			}
 
-			done := startCounter(ctx, second)
-			t.Cleanup(func() { cancel(); <-done })
+			startPollWorker(t, ctx, second)
 			if tc.reason == "drained" {
-				// A is ready; B still holds the last vote admitted before the deadline.
-				doneA := startCounter(ctx, f.handler)
-				t.Cleanup(func() { cancel(); <-doneA })
+				// Первая реплика закончила отправку. Вторая приняла голос в срок и ещё ждёт доставки в Kafka.
+				startPollWorker(t, ctx, f.application)
 				waitPG(ctx, t, f, `SELECT count(*) = 1 FROM poll_writers
 					WHERE poll_id = $1 AND drained_at IS NOT NULL`)
 				assertPartitionEnds(t, ctx, f, []int64{1, 0, 0, 0})
 				assertNoFinal(t, ctx, f)
 				close(gate.release)
 			}
-			// In the timeout case A never reports and B is the only scheduler.
-			// It must publish a final even with its OWN delivery callback stalled.
-			waitPG(ctx, t, f, `SELECT EXISTS (SELECT 1 FROM poll_results WHERE poll_id=$1)`)
+			// В сценарии timeout первая реплика не выставит drained_at. Вторая должна закрыть опрос
+			// по истечении срока ожидания, даже если её собственная отправка ещё не завершилась.
+			waitForFinal(t, ctx, f)
 			var reason string
 			var decidedAt, closesAt time.Time
 			var graceMicros int64
 			if err := f.pool.QueryRow(ctx, `SELECT decision_reason, decided_at, closes_at, grace_us
-				FROM poll_closures WHERE poll_id=$1 AND version=$2`, p.ID, p.Version).Scan(&reason, &decidedAt, &closesAt, &graceMicros); err != nil {
+				FROM poll_closures WHERE poll_id=$1`, p.ID).Scan(&reason, &decidedAt, &closesAt, &graceMicros); err != nil {
 				t.Fatal(err)
 			}
 			if graceMicros != pollGrace.Microseconds() {
 				t.Fatalf("stored grace is %d µs; first writer configured %s", graceMicros, pollGrace)
 			}
-			delay := decidedAt.Sub(closesAt) // Both timestamps came from PostgreSQL.
+			delay := decidedAt.Sub(closesAt) // Обе метки взяты из PostgreSQL, сверять часы реплик не требуется.
 			if reason != tc.reason || delay < 0 || (delay >= pollGrace) != (tc.reason == "timeout") {
 				t.Fatalf("decision=%s delay=%s; want %s", reason, delay, tc.reason)
 			}
@@ -121,8 +125,8 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 				t.Fatal(ctx.Err())
 			}
 			if tc.reason == "timeout" {
-				// The 503 and the stored final are both known. Only now let
-				// Kafka append the ambiguous record, after the first CLOSE.
+				// Разрешаем запись в Kafka только после HTTP 500 и публикации итога.
+				// Так запоздавший голос гарантированно окажется после первого CLOSE.
 				close(gate.release)
 			}
 			select {
@@ -136,7 +140,7 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 
 			var ballots, a, b, end int64
 			err = f.pool.QueryRow(ctx, `SELECT r.ballots,(r.counts->>'1')::bigint,(r.counts->>'2')::bigint,pr.end_offset
-				FROM poll_results r JOIN poll_partition_results pr USING(poll_id,version,algorithm)
+				FROM poll_results r JOIN poll_partition_results pr USING(poll_id)
 				WHERE r.poll_id=$1 AND pr.partition_id=0`, p.ID).Scan(&ballots, &a, &b, &end)
 			if err != nil {
 				t.Fatal(err)
@@ -150,19 +154,13 @@ func TestCountVotesAcrossReplicas(t *testing.T) {
 	}
 }
 
-func startCounter(ctx context.Context, h *app.Handler) <-chan struct{} {
-	done := make(chan struct{})
-	go func() { defer close(done); h.RunCounting(ctx) }()
-	return done
-}
-
-// Emulate a Kafka send with an ambiguous outcome on a real producer. The caller
-// can time out first; WaitVotes only succeeds when the real delivery settles.
+// Задерживаем отправку в настоящую Kafka. Запрос может завершиться по тайм-ауту,
+// пока голос ещё в пути. Через WaitVotes тест дожидается завершения отправки.
 type delayedJournal struct {
 	*kafka.Producer
 	ctx                          context.Context
 	admitted, release, delivered chan struct{}
-	err                          error // read only after delivered closes
+	err                          error // Читаем после закрытия delivered.
 }
 
 func (j *delayedJournal) Publish(ctx context.Context, p entity.Poll, v entity.VoteSubmitted) error {
@@ -190,26 +188,6 @@ func (j *delayedJournal) WaitVotes(ctx context.Context, id uuid.UUID) error {
 		return j.Producer.WaitVotes(ctx, id)
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-}
-
-func waitPG(ctx context.Context, t *testing.T, f *voteFixture, q string) {
-	t.Helper()
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		var ok bool
-		if err := f.pool.QueryRow(ctx, q, f.poll.ID).Scan(&ok); err != nil {
-			t.Fatal(err)
-		}
-		if ok {
-			return
-		}
-		select {
-		case <-tick.C:
-		case <-ctx.Done():
-			t.Fatalf("timeout waiting for %s: %v", q, ctx.Err())
-		}
 	}
 }
 

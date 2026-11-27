@@ -10,23 +10,24 @@ import (
 	"github.com/rococo4/televote/internal/entity"
 )
 
-func TestCloseMarkerMustMatchGenerationAndContainNoBallot(t *testing.T) {
-	poll := entity.Poll{ID: uuid.New(), Version: 2, Partitions: 4}
+func TestCloseMarkerMustMatchPollAndContainNoBallot(t *testing.T) {
+	poll := entity.Poll{ID: uuid.New(), Partitions: 4}
 	for _, tc := range []struct {
 		name    string
-		version int
+		pollID  uuid.UUID
 		key     []byte
 		fields  string
 		close   bool
 		invalid bool
 	}{
-		{name: "earlier poll version", version: 1},
-		{name: "current marker", version: 2, close: true},
-		{name: "vote key on marker", version: 2, key: make([]byte, 32), invalid: true},
-		{name: "choices on marker", version: 2, fields: `,"choices":[2]`, invalid: true},
+		{name: "other poll", pollID: uuid.New()},
+		{name: "missing poll ID", invalid: true},
+		{name: "current marker", pollID: poll.ID, close: true},
+		{name: "vote key on marker", pollID: poll.ID, key: make([]byte, 32), invalid: true},
+		{name: "choices on marker", pollID: poll.ID, fields: `,"choices":[2]`, invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`{"type":"CLOSE","poll_id":"%s","version":%d%s}`, poll.ID, tc.version, tc.fields)
+			body := fmt.Sprintf(`{"type":"CLOSE","poll_id":"%s"%s}`, tc.pollID, tc.fields)
 			closed, err := readEvent(poll, &kgo.Record{Key: tc.key, Value: []byte(body)}, func(entity.VoteSubmitted) error {
 				t.Fatal("marker decoded as a vote")
 				return nil
@@ -39,7 +40,7 @@ func TestCloseMarkerMustMatchGenerationAndContainNoBallot(t *testing.T) {
 }
 
 func TestReplayDistinguishesNullFromZeroChoice(t *testing.T) {
-	poll := entity.Poll{ID: uuid.New(), Version: 1, Partitions: 1}
+	poll := entity.Poll{ID: uuid.New(), Partitions: 1}
 	for _, tc := range []struct {
 		name, choice string
 		valid        bool
@@ -48,7 +49,7 @@ func TestReplayDistinguishesNullFromZeroChoice(t *testing.T) {
 		{name: "zero", choice: "0", valid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`{"poll_id":"%s","version":1,"choices":[%s]}`, poll.ID, tc.choice)
+			body := fmt.Sprintf(`{"poll_id":"%s","choices":[%s]}`, poll.ID, tc.choice)
 			var visited bool
 			closed, err := readEvent(poll, &kgo.Record{Key: make([]byte, 32), Value: []byte(body)}, func(v entity.VoteSubmitted) error {
 				visited = true

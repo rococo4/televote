@@ -32,9 +32,9 @@ import (
 
 const (
 	partitions     = 4
-	pollVersion    = 7
 	defaultDB      = "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"
 	testCloseGrace = 5 * time.Second
+	voterCookie    = "televote_voter"
 )
 
 func TestSubmitVoteWritesToKafka(t *testing.T) {
@@ -44,7 +44,7 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 	f := newVoteFixture(t, ctx, time.Hour)
 	id, topic, reader, server := f.poll.ID, f.poll.Topic, f.reader, f.server
 
-	// Pick a nonzero partition so a producer which always writes to 0 fails every run.
+	// Подбираем ключ для ненулевой партиции, чтобы заметить ошибку, при которой все голоса уходят в партицию 0.
 	var token uuid.UUID
 	var key [sha256.Size]byte
 	var wantPartition int32
@@ -67,7 +67,7 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 		windows[i].end = time.Now()
 	}
 
-	// Start reading after both HTTP responses to verify the stored records.
+	// После двух ответов HTTP 202 обе записи должны быть доступны независимому читателю Kafka.
 	reader.AddConsumeTopics(topic)
 	var records []*kgo.Record
 	for len(records) < len(choices) {
@@ -89,7 +89,6 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 		}
 		var event struct {
 			PollID     uuid.UUID       `json:"poll_id"`
-			Version    int64           `json:"version"`
 			ReceivedAt time.Time       `json:"received_at"`
 			Choices    []int           `json:"choices"`
 			Token      json.RawMessage `json:"token"`
@@ -97,8 +96,8 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 		if err := json.Unmarshal(record.Value, &event); err != nil {
 			t.Fatal(err)
 		}
-		if event.PollID != id || event.Version != pollVersion || !slices.Equal(event.Choices, []int{choices[i]}) {
-			t.Fatalf("vote %d: got poll %s version %d choices %v", i, event.PollID, event.Version, event.Choices)
+		if event.PollID != id || !slices.Equal(event.Choices, []int{choices[i]}) {
+			t.Fatalf("vote %d: got poll %s choices %v", i, event.PollID, event.Choices)
 		}
 		if event.ReceivedAt.Before(windows[i].start) || event.ReceivedAt.After(windows[i].end) {
 			t.Fatalf("vote %d received_at %s outside its HTTP request window %v", i, event.ReceivedAt, windows[i])
@@ -111,13 +110,13 @@ func TestSubmitVoteWritesToKafka(t *testing.T) {
 }
 
 type voteFixture struct {
-	poll    entity.Poll
-	reader  *kgo.Client
-	server  *httptest.Server
-	pool    *pgxpool.Pool
-	handler *app.Handler
-	writer  *kafka.Producer
-	brokers []string
+	poll        entity.Poll
+	reader      *kgo.Client
+	server      *httptest.Server
+	pool        *pgxpool.Pool
+	application *app.App
+	writer      *kafka.Producer
+	brokers     []string
 }
 
 func newVoteFixture(t *testing.T, ctx context.Context, openFor time.Duration) *voteFixture {
@@ -136,83 +135,75 @@ func newPollFixture(t *testing.T, ctx context.Context, openFor, closeGrace time.
 		t.Fatal(err)
 	}
 	t.Cleanup(reader.Close)
-	createTopic(t, ctx, reader, topic)
-	// PostgreSQL stores whole microseconds. Round down with Add so the local
-	// deadline also retains Go's monotonic clock for measuring finalization.
-	now := time.Now()
-	now = now.Add(-time.Duration(now.Nanosecond() % 1000))
-	poll := entity.Poll{
-		ID: id, Version: pollVersion, OpensAt: now.Add(-time.Hour), ClosesAt: now.Add(openFor),
-		MinChoices: 1, MaxChoices: maxChoices, Choices: make(map[int]struct{}, len(labels)),
-		Topic: topic, Partitions: partitions,
-	}
-	for i := range labels {
-		poll.Choices[i+1] = struct{}{}
-	}
-	insertOpenPoll(t, ctx, pool, poll, labels)
-
 	writer, err := kafka.New(brokers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(writer.Close)
-	handler, err := app.NewHandler(ctx, pool, writer, closeGrace, app.AdminConfig{Partitions: 4})
+	poll := entity.Poll{
+		ID: id, MinChoices: 1, MaxChoices: maxChoices, Choices: make(map[int]struct{}, len(labels)),
+		Topic: topic, Partitions: partitions,
+	}
+	for i := range labels {
+		poll.Choices[i+1] = struct{}{}
+	}
+	t.Cleanup(func() { deleteTopic(t, reader, topic) })
+	if _, err := writer.EnsureTopic(ctx, poll); err != nil {
+		t.Fatalf("prepare Kafka topic: %v", err)
+	}
+	// Отсчитываем окно голосования, когда топик готов. Сохраняем монотонное время
+	// для замера задержки и округляем до точности PostgreSQL.
+	now := time.Now()
+	now = now.Add(-time.Duration(now.Nanosecond() % 1000))
+	poll.OpensAt, poll.ClosesAt = now.Add(-time.Hour), now.Add(openFor)
+	insertOpenPoll(t, ctx, pool, poll, labels)
+
+	application, err := app.New(ctx, pool, writer, closeGrace, app.AdminConfig{Partitions: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(application)
 	t.Cleanup(server.Close)
 
 	return &voteFixture{
-		poll: poll, reader: reader, server: server, pool: pool, handler: handler,
+		poll: poll, reader: reader, server: server, pool: pool, application: application,
 		writer: writer, brokers: brokers,
 	}
 }
 
 func insertOpenPoll(t *testing.T, ctx context.Context, pool *pgxpool.Pool, poll entity.Poll, labels []string) {
 	t.Helper()
-	// Keep the poll and its options visible as one fixture to the startup query.
+	// Одним SQL-запросом создаём опрос вместе с вариантами. При запуске сервис увидит его целиком.
 	_, err := pool.Exec(ctx, `
 		WITH added AS (
-			INSERT INTO polls (id, version, question, opens_at, closes_at, min_choices, max_choices, topic, partitions, published)
-			VALUES ($1, $2, 'Choose an answer', $3, $4, 1, $5, $6, $7, true)
+			INSERT INTO polls (id, question, opens_at, closes_at, min_choices, max_choices, topic, partitions, published)
+			VALUES ($1, 'Choose an answer', $2, $3, 1, $4, $5, $6, true)
 			RETURNING id
 		)
 		INSERT INTO poll_choices (poll_id, id, label)
 		SELECT added.id, choice.id, choice.label FROM added
-		CROSS JOIN unnest($8::text[]) WITH ORDINALITY AS choice(label, id)`,
-		poll.ID, poll.Version, poll.OpensAt, poll.ClosesAt, poll.MaxChoices, poll.Topic, poll.Partitions, labels)
+		CROSS JOIN unnest($7::text[]) WITH ORDINALITY AS choice(label, id)`,
+		poll.ID, poll.OpensAt, poll.ClosesAt, poll.MaxChoices, poll.Topic, poll.Partitions, labels)
 	if err != nil {
 		t.Fatalf("insert poll into migrated PostgreSQL: %v", err)
 	}
 }
 
-func createTopic(t *testing.T, ctx context.Context, client *kgo.Client, topic string) {
+func deleteTopic(t *testing.T, client *kgo.Client, topic string) {
 	t.Helper()
-	create := kmsg.NewPtrCreateTopicsRequest()
-	create.Topics = []kmsg.CreateTopicsRequestTopic{{Topic: topic, NumPartitions: partitions, ReplicationFactor: 1}}
-	created, err := create.RequestWith(ctx, client)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	del := kmsg.NewPtrDeleteTopicsRequest()
+	del.Topics = []kmsg.DeleteTopicsRequestTopic{{Topic: &topic}}
+	del.TopicNames = []string{topic}
+	deleted, err := del.RequestWith(ctx, client)
 	if err != nil {
-		t.Fatalf("create Kafka topic: %v", err)
+		t.Errorf("delete Kafka topic: %v", err)
+	} else if len(deleted.Topics) != 1 {
+		t.Errorf("unexpected delete response: %+v", deleted.Topics)
+	} else if err := kerr.ErrorForCode(deleted.Topics[0].ErrorCode); err != nil && err != kerr.UnknownTopicOrPartition {
+		t.Errorf("delete Kafka topic: %v", err)
 	}
-	if len(created.Topics) != 1 || created.Topics[0].ErrorCode != 0 {
-		t.Fatalf("create Kafka topic: %+v", created.Topics)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		del := kmsg.NewPtrDeleteTopicsRequest()
-		del.Topics = []kmsg.DeleteTopicsRequestTopic{{Topic: &topic}}
-		del.TopicNames = []string{topic}
-		deleted, err := del.RequestWith(ctx, client)
-		if err != nil {
-			t.Errorf("delete Kafka topic: %v", err)
-		} else if len(deleted.Topics) != 1 {
-			t.Errorf("unexpected delete response: %+v", deleted.Topics)
-		} else if err := kerr.ErrorForCode(deleted.Topics[0].ErrorCode); err != nil {
-			t.Errorf("delete Kafka topic: %v", err)
-		}
-	})
 }
 
 func postVote(t *testing.T, ctx context.Context, client *http.Client, path, token string, choices ...int) {
@@ -225,7 +216,7 @@ func postVote(t *testing.T, ctx context.Context, client *http.Client, path, toke
 
 func sendBallot(t *testing.T, ctx context.Context, client *http.Client, path, token string, choices []int) (int, map[string]string) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"token": token, "choices": choices})
+	body, err := json.Marshal(map[string]any{"choices": choices})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +225,7 @@ func sendBallot(t *testing.T, ctx context.Context, client *http.Client, path, to
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: voterCookie, Value: token})
 	res, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +247,7 @@ func setting(name, fallback string) string {
 
 func newTestDatabase(t *testing.T, ctx context.Context) *pgxpool.Pool {
 	t.Helper()
-	// App startup binds every published poll. Isolate all tests from existing polls.
+	// При запуске сервис загружает все опубликованные опросы. Отдельная схема оставляет в выборке только данные теста.
 	cfg, err := pgxpool.ParseConfig(setting("DATABASE_URL", defaultDB))
 	if err != nil {
 		t.Fatal(err)

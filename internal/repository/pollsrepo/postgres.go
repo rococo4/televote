@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rococo4/televote/internal/entity"
-	"github.com/rococo4/televote/internal/repository/resultsrepo"
 )
 
 //go:embed queries/load_published.sql
@@ -31,8 +30,8 @@ func (r *Repository) LoadPublished(ctx context.Context) ([]entity.Poll, error) {
 func (r *Repository) LoadUnfinished(ctx context.Context) ([]entity.Poll, error) {
 	return r.load(ctx, loadPublishedSQL+`
 		AND NOT EXISTS (SELECT 1 FROM poll_results f
-		                WHERE f.poll_id=p.id AND f.version=p.version AND f.algorithm=$1)
-		ORDER BY p.id`, resultsrepo.AlgorithmVersion)
+		                WHERE f.poll_id=p.id)
+		ORDER BY p.id`)
 }
 
 func (r *Repository) FindPublished(ctx context.Context, id uuid.UUID) (entity.Poll, error) {
@@ -44,8 +43,8 @@ func (r *Repository) FindPublished(ctx context.Context, id uuid.UUID) (entity.Po
 	return poll, err
 }
 
-func (r *Repository) load(ctx context.Context, query string, args ...any) ([]entity.Poll, error) {
-	rows, err := r.pool.Query(ctx, query, args...)
+func (r *Repository) load(ctx context.Context, query string) ([]entity.Poll, error) {
+	rows, err := r.pool.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("query published polls: %w", err)
 	}
@@ -67,17 +66,16 @@ func (r *Repository) load(ctx context.Context, query string, args ...any) ([]ent
 
 func scanPoll(row pgx.Row) (entity.Poll, error) {
 	var poll entity.Poll
-	var choices []int32
-	if err := row.Scan(&poll.ID, &poll.Version, &poll.OpensAt, &poll.ClosesAt,
-		&poll.MinChoices, &poll.MaxChoices, &poll.Topic, &poll.Partitions, &choices); err != nil {
+	if err := row.Scan(&poll.ID, &poll.Question, &poll.OpensAt, &poll.ClosesAt,
+		&poll.MinChoices, &poll.MaxChoices, &poll.Topic, &poll.Partitions, &poll.Options); err != nil {
 		return poll, fmt.Errorf("scan published poll: %w", err)
 	}
-	if poll.MaxChoices > len(choices) {
-		return poll, fmt.Errorf("published poll %s permits %d choices but has %d", poll.ID, poll.MaxChoices, len(choices))
+	if poll.MaxChoices > len(poll.Options) {
+		return poll, fmt.Errorf("published poll %s permits %d choices but has %d", poll.ID, poll.MaxChoices, len(poll.Options))
 	}
-	poll.Choices = make(map[int]struct{}, len(choices))
-	for _, id := range choices {
-		poll.Choices[int(id)] = struct{}{}
+	poll.Choices = make(map[int]struct{}, len(poll.Options))
+	for _, choice := range poll.Options {
+		poll.Choices[choice.ID] = struct{}{}
 	}
 	return poll, nil
 }

@@ -6,13 +6,20 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rococo4/televote/internal/entity"
-	"golang.org/x/sync/errgroup"
 )
+
+// GroupCallbacks позволяет читателю узнать, какие итоги уже записаны в PostgreSQL,
+// и начать подсчёт одной партиции с нуля. Если Kafka отзывает партицию,
+// читатель отбрасывает накопленные голоса. Итог сохраняется на первом CLOSE.
+type GroupCallbacks struct {
+	Progress func(context.Context) (bool, map[int32]bool, error)
+	Start    func(partition int32) (visit func(entity.VoteSubmitted) error, save func(context.Context, int64) error)
+}
 
 type Journal interface {
 	TopicID(context.Context, entity.Poll) (uuid.UUID, error)
 	MarkClosed(context.Context, entity.Poll, int32) error
-	ReadPartition(context.Context, entity.Poll, uuid.UUID, int32, func(entity.VoteSubmitted) error) (int64, error)
+	ConsumePoll(context.Context, entity.Poll, uuid.UUID, GroupCallbacks) error
 }
 
 type Results interface {
@@ -26,7 +33,7 @@ type Results interface {
 type Service struct {
 	journal Journal
 	results Results
-	// Bound memory across all polls: each reader holds one partition's voter keys.
+	// На каждый занятый слот приходится одна партиция, голоса которой хранятся в памяти.
 	slots chan struct{}
 }
 
@@ -34,7 +41,7 @@ func New(journal Journal, results Results) *Service {
 	return &Service{journal: journal, results: results, slots: make(chan struct{}, 4)}
 }
 
-// Prepare binds the published configuration to the broker's topic UUID.
+// Prepare сохраняет UUID топика, чтобы при подсчёте обнаружить его замену.
 func (s *Service) Prepare(ctx context.Context, p entity.Poll) error {
 	id, err := s.journal.TopicID(ctx, p)
 	if err != nil {
@@ -48,7 +55,8 @@ func (s *Service) IsFinal(ctx context.Context, p entity.Poll) (bool, error) {
 	return final, err
 }
 
-// Count may publish markers only after the shared close decision is durable.
+// Count ставит маркеры CLOSE и запускает подсчёт. К моменту вызова решение
+// о закрытии опроса уже должно быть записано в PostgreSQL.
 func (s *Service) Count(ctx context.Context, p entity.Poll) error {
 	final, done, err := s.results.Progress(ctx, p)
 	if err != nil || final {
@@ -66,8 +74,8 @@ func (s *Service) Count(ctx context.Context, p entity.Poll) error {
 		return err
 	}
 	if !bound {
-		// Closed polls from before counting was deployed have no saved topic UUID.
-		// Adopt their existing journal once, then check its identity on every retry.
+		// У старых опросов UUID топика ещё не сохранялся. Записываем его сейчас,
+		// чтобы при повторном подсчёте заметить замену топика под тем же именем.
 		if err := s.results.Bind(ctx, p, currentID); err != nil {
 			return err
 		}
@@ -83,54 +91,48 @@ func (s *Service) Count(ctx context.Context, p entity.Poll) error {
 		}
 	}
 
-	group, workerCtx := errgroup.WithContext(ctx)
-	for partition := range int32(p.Partitions) {
-		if done[partition] {
-			continue
-		}
-		select {
-		case s.slots <- struct{}{}:
-			group.Go(func() error {
-				defer func() { <-s.slots }()
-				result, err := s.countPartition(workerCtx, p, topicID, partition)
-				if err != nil {
-					return fmt.Errorf("count partition %d: %w", partition, err)
-				}
-				return s.results.SavePartition(workerCtx, p, result)
-			})
-		case <-workerCtx.Done():
-			if err := group.Wait(); err != nil {
-				return err
-			}
-			return workerCtx.Err()
-		}
+	select {
+	case s.slots <- struct{}{}:
+		defer func() { <-s.slots }()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if err := group.Wait(); err != nil {
+	callbacks := GroupCallbacks{
+		Progress: func(ctx context.Context) (bool, map[int32]bool, error) {
+			return s.results.Progress(ctx, p)
+		},
+		Start: func(partition int32) (func(entity.VoteSubmitted) error, func(context.Context, int64) error) {
+			return s.startPartition(p, partition)
+		},
+	}
+	if err := s.journal.ConsumePoll(ctx, p, topicID, callbacks); err != nil {
 		return err
 	}
 	return s.results.Finalize(ctx, p)
 }
 
-func (s *Service) countPartition(ctx context.Context, p entity.Poll, topicID uuid.UUID, partition int32) (entity.PartitionResult, error) {
+func (s *Service) startPartition(p entity.Poll, partition int32) (func(entity.VoteSubmitted) error, func(context.Context, int64) error) {
 	last := make(map[[32]byte][]int)
-	end, err := s.journal.ReadPartition(ctx, p, topicID, partition, func(vote entity.VoteSubmitted) error {
-		if vote.PollID == p.ID && vote.Version == p.Version && p.CheckWindow(vote.ReceivedAt) == nil &&
+	visit := func(vote entity.VoteSubmitted) error {
+		if vote.PollID == p.ID && p.CheckWindow(vote.ReceivedAt) == nil &&
 			p.ValidateBallot(entity.Ballot{Choices: vote.Choices}) == nil {
 			last[vote.VoterKey] = vote.Choices
 		}
 		return nil
-	})
-	if err != nil {
-		return entity.PartitionResult{}, err
 	}
-	counts := make(map[int]int64, len(p.Choices))
-	for id := range p.Choices {
-		counts[id] = 0
-	}
-	for _, choices := range last {
-		for _, id := range choices {
-			counts[id]++
+	save := func(ctx context.Context, end int64) error {
+		counts := make(map[int]int64, len(p.Choices))
+		for id := range p.Choices {
+			counts[id] = 0
 		}
+		for _, choices := range last {
+			for _, id := range choices {
+				counts[id]++
+			}
+		}
+		return s.results.SavePartition(ctx, p, entity.PartitionResult{
+			Partition: partition, EndOffset: end, Ballots: int64(len(last)), Counts: counts,
+		})
 	}
-	return entity.PartitionResult{Partition: partition, EndOffset: end, Ballots: int64(len(last)), Counts: counts}, nil
+	return visit, save
 }

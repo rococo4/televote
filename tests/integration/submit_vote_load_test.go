@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,19 +33,9 @@ func TestSubmitVoteLoad(t *testing.T) {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	// Reserve ten seconds beyond the one-minute input profile for local timer jitter.
+	// После минуты нагрузки оставляем десять секунд запаса на задержки локального генератора.
 	f := newVoteFixture(t, ctx, 70*time.Second)
-	countDone := make(chan struct{})
-	var finalized time.Time
-	go func() {
-		f.handler.RunCounting(ctx)
-		finalized = time.Now()
-		close(countDone)
-	}()
-	defer func() {
-		cancel()
-		<-countDone
-	}()
+	startPollWorker(t, ctx, f.application)
 	id, topic, reader, server := f.poll.ID, f.poll.Topic, f.reader, f.server
 	path := server.URL + "/api/polls/" + id.String() + "/votes"
 	const maxInflight = 128
@@ -57,17 +48,20 @@ func TestSubmitVoteLoad(t *testing.T) {
 	const perPhase = 15000
 	const total = 2 * perPhase
 	bodies := make([]string, total)
+	// Измеряем приём голосов со знакомыми cookie. Выдача cookie при открытии опроса в этот замер не входит.
+	cookies := make([]string, total)
 	keys := make([]string, total)
 	wantCounts := make(map[int]int64)
 	for i := range bodies {
-		// Within each complete group of eleven POSTs, repeat the tenth voter.
+		// На каждые десять зрителей приходится одиннадцать запросов. Десятый зритель отправляет свой ответ дважды.
 		voter := i/11*10 + min(i%11, 9)
 		if i%11 != 10 {
 			wantCounts[voter%2+1]++
 		}
 		var token [16]byte
 		binary.BigEndian.PutUint64(token[8:], uint64(voter+1))
-		bodies[i] = fmt.Sprintf(`{"token":"%x","choices":[%d]}`, token, voter%2+1)
+		cookies[i] = hex.EncodeToString(token[:])
+		bodies[i] = fmt.Sprintf(`{"choices":[%d]}`, voter%2+1)
 		var identity [32]byte
 		copy(identity[:16], id[:])
 		copy(identity[16:], token[:])
@@ -86,7 +80,7 @@ func TestSubmitVoteLoad(t *testing.T) {
 		interval := duration / perPhase
 		for n := range perPhase {
 			time.Sleep(time.Until(next))
-			// Resume pacing after a scheduler pause instead of replaying a burst.
+			// После паузы планировщика сохраняем интервал между запросами, иначе генератор пошлёт их залпом.
 			if now := time.Now(); now.Sub(next) >= interval {
 				next = now
 			}
@@ -96,43 +90,40 @@ func TestSubmitVoteLoad(t *testing.T) {
 			case slots <- struct{}{}:
 				pending.Go(func() {
 					defer func() { <-slots }()
-					samples[i] = measureVote(ctx, client, path, bodies[i])
+					samples[i] = measureVote(ctx, client, path, bodies[i], cookies[i])
 				})
 			default:
-				// Leave this slot empty so generator saturation is observable.
+				// Генератор исчерпал лимит одновременных запросов. В отчёте эта попытка попадёт в dropped.
 			}
 		}
 		time.Sleep(time.Until(next))
 	}
 	pending.Wait()
+	waitForFinal(t, ctx, f)
+	finalObservedAt := time.Now()
 	for phase, duration := range durations {
 		reportVotePhase(t, samples[phase*perPhase:(phase+1)*perPhase], phaseStarts[phase], duration)
-	}
-	select {
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for final result")
-	case <-countDone:
 	}
 	var ballots int64
 	var counts map[int]int64
 	err := f.pool.QueryRow(ctx, `SELECT ballots, counts FROM poll_results
-		WHERE poll_id = $1 AND version = $2 AND algorithm = 1`, id, f.poll.Version).Scan(&ballots, &counts)
+		WHERE poll_id = $1`, id).Scan(&ballots, &counts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ballots != wantCounts[1]+wantCounts[2] || !maps.Equal(counts, wantCounts) {
 		t.Errorf("final: %d ballots, counts %v; expected %v", ballots, counts, wantCounts)
 	}
-	finalDelay := finalized.Sub(f.poll.ClosesAt)
+	finalDelay := finalObservedAt.Sub(f.poll.ClosesAt)
 	if finalDelay < 0 || finalDelay > time.Since(started) {
 		t.Fatalf("inconsistent finalization interval %s", finalDelay)
 	}
-	t.Logf("PostgreSQL: %d ballots, A=%d B=%d, elapsed since poll deadline %s", ballots, counts[1], counts[2], finalDelay)
+	t.Logf("PostgreSQL: %d ballots, A=%d B=%d, observed final %s after poll deadline", ballots, counts[1], counts[2], finalDelay)
 	readCtx, stop := context.WithTimeout(ctx, 20*time.Second)
 	defer stop()
 	gotKeys := readLoadVoteKeys(t, readCtx, reader, topic)
-	// An HTTP timeout can still leave a Kafka record. Every confirmed request
-	// must appear, and no key may have more records than attempts actually sent.
+	// Даже если клиент не дождался ответа, запись могла попасть в Kafka. Для каждого ключа
+	// число записей должно быть не меньше числа ответов 202 и не больше числа отправленных запросов.
 	attempts, confirmed := make(map[string]int), make(map[string]int)
 	for i, sample := range samples {
 		if !sample.finished.IsZero() {
@@ -154,12 +145,13 @@ func TestSubmitVoteLoad(t *testing.T) {
 	}
 }
 
-func measureVote(ctx context.Context, client *http.Client, path, body string) (s voteSample) {
+func measureVote(ctx context.Context, client *http.Client, path, body, cookie string) (s voteSample) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, path, strings.NewReader(body))
 	if err != nil {
-		panic(err) // Static test URL and method.
+		panic(err) // Метод и URL задаёт сам тест, поэтому ошибка означает сбой генератора.
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: voterCookie, Value: cookie})
 	start := time.Now()
 	defer func() {
 		s.finished = time.Now()
@@ -233,7 +225,9 @@ func readLoadVoteKeys(t *testing.T, ctx context.Context, reader *kgo.Client, top
 	for i := range partitions {
 		p := kmsg.NewListOffsetsRequestTopicPartition()
 		p.Partition = int32(i)
-		p.Timestamp = -1 // Log end offset on an initially empty, nontransactional topic.
+		// Запрашиваем следующую позицию после последней записи. В тестовом топике без транзакций
+		// и удалённых записей она совпадает с числом записей в партиции.
+		p.Timestamp = -1
 		partitionQuery.Partitions = append(partitionQuery.Partitions, p)
 	}
 	request.Topics = []kmsg.ListOffsetsRequestTopic{partitionQuery}

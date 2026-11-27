@@ -15,6 +15,7 @@ import (
 	"github.com/rococo4/televote/internal/adapter/kafka"
 	"github.com/rococo4/televote/internal/app"
 	"github.com/rococo4/televote/internal/entity"
+	"github.com/rococo4/televote/internal/repository/closurerepo"
 	"github.com/rococo4/televote/internal/repository/resultsrepo"
 	"github.com/rococo4/televote/internal/service/voting"
 )
@@ -24,12 +25,12 @@ func TestCountVotesAfterClose(t *testing.T) {
 	defer cancel()
 	f := newVoteFixture(t, ctx, 5*time.Second)
 	p := f.poll
-	if err := f.handler.CountClosedPoll(ctx, p.ID); !errors.Is(err, voting.ErrStillOpen) {
+	if err := f.application.CountClosedPoll(ctx, p.ID); !errors.Is(err, voting.ErrStillOpen) {
 		t.Fatalf("count while open: got %v, want ErrStillOpen", err)
 	}
 
-	// Separate voters into known partitions so both the nonempty and empty
-	// partitions have independently predictable closing offsets.
+	// Подбираем токены для партиций 0 и 1. Остальные останутся пустыми,
+	// поэтому позицию CLOSE в каждой партиции можно предсказать заранее.
 	x, y := tokenForPartition(p, 0), tokenForPartition(p, 1)
 	path := f.server.URL + "/api/polls/" + p.ID.String() + "/votes"
 	for _, vote := range []struct {
@@ -38,32 +39,37 @@ func TestCountVotesAfterClose(t *testing.T) {
 	}{{x, 1}, {x, 2}, {y, 2}} {
 		postVote(t, ctx, f.server.Client(), path, vote.token, vote.choice)
 	}
-	time.Sleep(time.Until(p.ClosesAt))
+	// А завершит отправки первым. Последний писатель Б примет решение,
+	// успеет отправить только часть маркеров и остановится.
+	b := uuid.New()
+	closures := closurerepo.New(f.pool, time.Hour)
+	if joined, _, err := closures.Join(ctx, p, b); err != nil || !joined {
+		t.Fatalf("register writer B: joined=%v, err=%v", joined, err)
+	}
+	stopA := startPollWorker(t, ctx, f.application)
+	waitPG(ctx, t, f, `SELECT frozen AND decided_at IS NULL FROM poll_closures WHERE poll_id=$1`)
+	if err := closures.Drain(ctx, p, b); err != nil {
+		t.Fatal(err)
+	}
+	if ready, _, err := closures.Decide(ctx, p); err != nil || !ready {
+		t.Fatalf("last writer's decision: ready=%v, err=%v", ready, err)
+	}
 
-	// Reproduce a stopped worker's durable state: partition 2 already has
-	// its closing record and a committed zero result. No tests write counts
-	// directly to SQL, so this also checks that partial results stay private.
+	// Воспроизводим остановку между партициями. Для пустой партиции 2 уже сохранён
+	// нулевой итог, но результат всего опроса публиковать ещё рано.
 	const finished int32 = 2
 	store := resultsrepo.New(f.pool)
-	topicID, bound, err := store.BoundTopic(ctx, p)
-	if err != nil || !bound {
-		t.Fatalf("load topic manifest: bound=%v, err=%v", bound, err)
-	}
-	// Partition 0 got its marker before the interruption, but has no SQL
-	// result. Recovery must honor this first marker even if it sends another.
+	// В партиции 0 после голосов уже стоит CLOSE, а её итог ещё не сохранён.
+	// При повторной попытке границу подсчёта по-прежнему задаёт первый CLOSE.
 	if err := f.writer.MarkClosed(ctx, p, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.writer.MarkClosed(ctx, p, finished); err != nil {
 		t.Fatal(err)
 	}
-	end, err := f.writer.ReadPartition(ctx, p, topicID, finished, func(entity.VoteSubmitted) error {
-		return errors.New("unexpected vote in the empty partition")
-	})
-	if err != nil || end != 0 {
-		t.Fatalf("empty partition: close offset=%d, error=%v", end, err)
-	}
-	partial := entity.PartitionResult{Partition: finished, EndOffset: end, Counts: map[int]int64{1: 0, 2: 0}}
+	// В пустой партиции 2 маркер занял позицию 0, поэтому следующая позиция равна 1.
+	assertPartitionEnds(t, ctx, f, []int64{3, 1, 1, 0})
+	partial := entity.PartitionResult{Partition: finished, EndOffset: 0, Counts: map[int]int64{1: 0, 2: 0}}
 	if err := store.SavePartition(ctx, p, partial); err != nil {
 		t.Fatal(err)
 	}
@@ -75,19 +81,20 @@ func TestCountVotesAfterClose(t *testing.T) {
 		t.Fatalf("final rows before all partitions completed: %d, error=%v", finals, err)
 	}
 
-	if err := f.handler.CountClosedPoll(ctx, p.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Под А уже ждал общего срока в момент остановки Б. Он подхватит
+	// оставшиеся партиции по сохранённому решению.
+	waitForFinal(t, ctx, f)
 	checkCountedPoll(t, ctx, f)
 
-	// A fresh handler and Kafka client discover the persisted final in SQL.
+	// После перезапуска обработчик должен найти сохранённый итог в PostgreSQL.
+	stopA()
 	f.server.Close()
 	producer, err := kafka.New(f.brokers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(producer.Close)
-	restarted, err := app.NewHandler(ctx, f.pool, producer, testCloseGrace, app.AdminConfig{Partitions: 4})
+	restarted, err := app.New(ctx, f.pool, producer, testCloseGrace, app.AdminConfig{Partitions: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,15 +105,15 @@ func TestCountVotesAfterClose(t *testing.T) {
 	t.Log("3 HTTP 202s; 4 persisted partition results (2 empty); final 2 ballots, A=0 B=2 before and after restart")
 
 	t.Run("result predating writer registration", func(t *testing.T) {
-		// A final written before migration 003 has no accompanying closure row.
-		if _, err := f.pool.Exec(ctx, "DELETE FROM poll_closures WHERE poll_id=$1 AND version=$2", p.ID, p.Version); err != nil {
+		// У опросов, завершённых до миграции 003, уже есть итог, а записи в poll_closures ещё нет.
+		if _, err := f.pool.Exec(ctx, "DELETE FROM poll_closures WHERE poll_id=$1", p.ID); err != nil {
 			t.Fatal(err)
 		}
 		if err := restarted.CountClosedPoll(ctx, p.ID); err != nil {
 			t.Fatal(err)
 		}
 		var exists bool
-		if err := f.pool.QueryRow(ctx, "SELECT EXISTS(SELECT FROM poll_closures WHERE poll_id=$1 AND version=$2)", p.ID, p.Version).Scan(&exists); err != nil || exists {
+		if err := f.pool.QueryRow(ctx, "SELECT EXISTS(SELECT FROM poll_closures WHERE poll_id=$1)", p.ID).Scan(&exists); err != nil || exists {
 			t.Fatalf("retroactive close decision: exists=%v err=%v", exists, err)
 		}
 		checkCountedPoll(t, ctx, f)
@@ -128,8 +135,8 @@ func checkCountedPoll(t *testing.T, ctx context.Context, f *voteFixture) {
 	var ballots int64
 	var counts map[int]int64
 	if err := f.pool.QueryRow(ctx, `
-		SELECT ballots, counts FROM poll_results WHERE poll_id = $1 AND version = $2 AND algorithm = 1`,
-		f.poll.ID, f.poll.Version).Scan(&ballots, &counts); err != nil {
+		SELECT ballots, counts FROM poll_results WHERE poll_id = $1`,
+		f.poll.ID).Scan(&ballots, &counts); err != nil {
 		t.Fatal(err)
 	}
 	if ballots != 2 || !maps.Equal(counts, map[int]int64{1: 0, 2: 2}) {
@@ -137,8 +144,8 @@ func checkCountedPoll(t *testing.T, ctx context.Context, f *voteFixture) {
 	}
 
 	rows, err := f.pool.Query(ctx, `
-		SELECT partition_id, start_offset, end_offset, ballots, counts FROM poll_partition_results
-		WHERE poll_id = $1 AND version = $2 AND algorithm = 1 ORDER BY partition_id`, f.poll.ID, f.poll.Version)
+		SELECT partition_id, end_offset, ballots, counts FROM poll_partition_results
+		WHERE poll_id = $1 ORDER BY partition_id`, f.poll.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,16 +154,16 @@ func checkCountedPoll(t *testing.T, ctx context.Context, f *voteFixture) {
 	wantBallots := []int64{1, 1, 0, 0}
 	for i := range partitions {
 		var part int
-		var start, end, n int64
+		var end, n int64
 		var choices map[int]int64
 		if !rows.Next() {
 			t.Fatalf("missing partition %d: %v", i, rows.Err())
 		}
-		if err := rows.Scan(&part, &start, &end, &n, &choices); err != nil {
+		if err := rows.Scan(&part, &end, &n, &choices); err != nil {
 			t.Fatal(err)
 		}
-		if part != i || start != 0 || end != wantEnds[i] || n != wantBallots[i] || !maps.Equal(choices, map[int]int64{1: 0, 2: wantBallots[i]}) {
-			t.Fatalf("unexpected partition result: id=%d range=[%d,%d) ballots=%d counts=%v", part, start, end, n, choices)
+		if part != i || end != wantEnds[i] || n != wantBallots[i] || !maps.Equal(choices, map[int]int64{1: 0, 2: wantBallots[i]}) {
+			t.Fatalf("unexpected partition result: id=%d end_offset=%d ballots=%d counts=%v", part, end, n, choices)
 		}
 	}
 	if rows.Next() || rows.Err() != nil {

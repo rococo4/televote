@@ -14,23 +14,25 @@ import (
 //go:embed queries/results.sql
 var resultsSQL string
 
-// Draft reserves the immutable definition before Kafka is contacted. Concurrent
-// requests for an ID see either the complete definition or a rolled back insert.
+// Draft сохраняет вопрос и варианты ответа одной транзакцией до создания топика.
+// Если черновик с этим ID уже есть, параметры запроса должны с ним совпасть.
 func (r *Repository) Draft(ctx context.Context, spec entity.CreatePoll, partitions int) (entity.Poll, bool, error) {
 	poll := entity.Poll{
-		ID: spec.ID, Version: 1, Topic: "televote-" + spec.ID.String(), Partitions: partitions,
+		ID: spec.ID, Topic: "televote-" + spec.ID.String(), Partitions: partitions,
 		OpensAt: spec.OpensAt, ClosesAt: spec.ClosesAt, MinChoices: spec.MinChoices, MaxChoices: spec.MaxChoices,
+		Question: spec.Question, Options: make([]entity.PollChoice, len(spec.Choices)),
 		Choices: make(map[int]struct{}, len(spec.Choices)),
 	}
-	for i := range spec.Choices {
+	for i, label := range spec.Choices {
 		poll.Choices[i+1] = struct{}{}
+		poll.Options[i] = entity.PollChoice{ID: i + 1, Label: label}
 	}
 	var published bool
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO polls (id, version, question, opens_at, closes_at, min_choices, max_choices, topic, partitions)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
-			poll.ID, poll.Version, spec.Question, poll.OpensAt, poll.ClosesAt, poll.MinChoices, poll.MaxChoices, poll.Topic, poll.Partitions)
+			INSERT INTO polls (id, question, opens_at, closes_at, min_choices, max_choices, topic, partitions)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (id) DO NOTHING`,
+			poll.ID, spec.Question, poll.OpensAt, poll.ClosesAt, poll.MinChoices, poll.MaxChoices, poll.Topic, poll.Partitions)
 		if err != nil {
 			return err
 		}
@@ -48,19 +50,19 @@ func (r *Repository) Draft(ctx context.Context, spec entity.CreatePoll, partitio
 			return nil
 		}
 
-		// The conflict may have waited for another transaction. This next
-		// statement uses a fresh READ COMMITTED snapshot including its choices.
-		// Retain the original partition count across configuration changes.
+		// INSERT мог ждать, пока другая транзакция сохранит опрос с этим ID.
+		// При READ COMMITTED отдельный SELECT уже видит и вопрос, и его варианты.
+		// Число партиций берём из черновика, даже если настройки сервиса изменились.
 		var same bool
 		err = tx.QueryRow(ctx, `
 			SELECT p.published, p.partitions,
-			       p.version=$2 AND p.question=$3 AND p.opens_at=$4 AND p.closes_at=$5
-			       AND p.min_choices=$6 AND p.max_choices=$7 AND p.topic=$8
-			       AND ARRAY(SELECT c.label FROM poll_choices c WHERE c.poll_id=p.id ORDER BY c.id)=$9::text[]
+			       p.question=$2 AND p.opens_at=$3 AND p.closes_at=$4
+			       AND p.min_choices=$5 AND p.max_choices=$6 AND p.topic=$7
+			       AND ARRAY(SELECT c.label FROM poll_choices c WHERE c.poll_id=p.id ORDER BY c.id)=$8::text[]
 			       AND ARRAY(SELECT c.id FROM poll_choices c WHERE c.poll_id=p.id ORDER BY c.id)
-			           = ARRAY(SELECT generate_series(1,cardinality($9::text[])))
+			           = ARRAY(SELECT generate_series(1,cardinality($8::text[])))
 			FROM polls p WHERE p.id=$1`,
-			poll.ID, poll.Version, spec.Question, poll.OpensAt, poll.ClosesAt, poll.MinChoices, poll.MaxChoices,
+			poll.ID, spec.Question, poll.OpensAt, poll.ClosesAt, poll.MinChoices, poll.MaxChoices,
 			poll.Topic, spec.Choices).Scan(&published, &poll.Partitions, &same)
 		if err != nil {
 			return err
@@ -78,7 +80,7 @@ func (r *Repository) Draft(ctx context.Context, spec entity.CreatePoll, partitio
 
 func (r *Repository) Publish(ctx context.Context, poll entity.Poll, topicID uuid.UUID) error {
 	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, "UPDATE polls SET published=true WHERE id=$1 AND version=$2", poll.ID, poll.Version)
+		tag, err := tx.Exec(ctx, "UPDATE polls SET published=true WHERE id=$1", poll.ID)
 		if err != nil {
 			return fmt.Errorf("publish poll %s: %w", poll.ID, err)
 		}
@@ -90,7 +92,7 @@ func (r *Repository) Publish(ctx context.Context, poll entity.Poll, topicID uuid
 }
 
 func (r *Repository) Results(ctx context.Context, id uuid.UUID) (entity.PollReport, error) {
-	rows, err := r.pool.Query(ctx, resultsSQL, id, resultsrepo.AlgorithmVersion)
+	rows, err := r.pool.Query(ctx, resultsSQL, id)
 	if err != nil {
 		return entity.PollReport{}, err
 	}

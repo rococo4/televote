@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rococo4/televote/internal/entity"
 	"github.com/rococo4/televote/internal/repository/pollsrepo"
-	"github.com/rococo4/televote/internal/repository/resultsrepo"
 )
 
 func pollTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
@@ -29,7 +29,7 @@ func pollTestDB(t *testing.T) (context.Context, *pgxpool.Pool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Apply the production migration in a schema owned by this test.
+	// Отдельная схема позволяет проверить миграции сервиса на пустых таблицах.
 	schema := pgx.Identifier{"televote_test_" + uuid.NewString()}.Sanitize()
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
@@ -65,12 +65,12 @@ func TestLoadPublished(t *testing.T) {
 	open := time.Now().UTC().Truncate(time.Second)
 	closeAt := open.Add(time.Minute)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO polls (id, version, question, opens_at, closes_at, min_choices, max_choices, topic, partitions, published)
-		VALUES ($1, 7, 'A/B?', $2, $3, 1, 1, 'open-poll', 3, true),
-		       ($4, 1, 'Draft', $2, $3, 1, 1, 'draft-poll', 2, false)`, id, open, closeAt, uuid.New()); err != nil {
+		INSERT INTO polls (id, question, opens_at, closes_at, min_choices, max_choices, topic, partitions, published)
+		VALUES ($1, 'A/B?', $2, $3, 1, 1, 'open-poll', 3, true),
+		       ($4, 'Draft', $2, $3, 1, 1, 'draft-poll', 2, false)`, id, open, closeAt, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "INSERT INTO poll_choices (poll_id, id, label) VALUES ($1, 1, 'A'), ($1, 2, 'B')", id); err != nil {
+	if _, err := pool.Exec(ctx, "INSERT INTO poll_choices (poll_id, id, label) VALUES ($1, 9, 'B'), ($1, 1, 'A')", id); err != nil {
 		t.Fatal(err)
 	}
 	polls, err := pollsrepo.New(pool).LoadPublished(ctx)
@@ -81,14 +81,17 @@ func TestLoadPublished(t *testing.T) {
 		t.Fatalf("loaded %d polls, want exactly one published poll", len(polls))
 	}
 	poll := polls[0]
-	if poll.ID != id || poll.Version != 7 || poll.Topic != "open-poll" || poll.Partitions != 3 ||
+	if poll.ID != id || poll.Topic != "open-poll" || poll.Partitions != 3 ||
 		!poll.OpensAt.Equal(open) || !poll.ClosesAt.Equal(closeAt) || poll.MinChoices != 1 || poll.MaxChoices != 1 {
 		t.Fatalf("unexpected published configuration: %+v", poll)
 	}
+	if poll.Question != "A/B?" || !slices.Equal(poll.Options, []entity.PollChoice{{ID: 1, Label: "A"}, {ID: 9, Label: "B"}}) {
+		t.Fatalf("unexpected public poll: %q %+v", poll.Question, poll.Options)
+	}
 	_, hasA := poll.Choices[1]
-	_, hasB := poll.Choices[2]
+	_, hasB := poll.Choices[9]
 	if !hasA || !hasB || len(poll.Choices) != 2 {
-		t.Fatalf("loaded choices: %v, want 1 and 2", poll.Choices)
+		t.Fatalf("loaded choices: %v, want 1 and 9", poll.Choices)
 	}
 }
 
@@ -133,6 +136,10 @@ func TestDraftPublicationAndRecovery(t *testing.T) {
 	if err := repo.Publish(ctx, poll, topicID); err != nil {
 		t.Fatal(err)
 	}
+	reloaded, err := repo.FindPublished(ctx, poll.ID)
+	if err != nil || reloaded.Question != spec.Question || reloaded.Question != poll.Question || !slices.Equal(reloaded.Options, poll.Options) {
+		t.Fatalf("published and reloaded ballots differ: %+v, %+v, err=%v", poll, reloaded, err)
+	}
 	if err := repo.Publish(ctx, poll, uuid.New()); err == nil {
 		t.Fatal("rebound published poll to a new topic")
 	}
@@ -140,7 +147,7 @@ func TestDraftPublicationAndRecovery(t *testing.T) {
 	if err != nil || report.Status != "open" || report.Ballots != nil || len(report.Choices) != 2 || report.Choices[0].Votes != nil {
 		t.Fatalf("open report: %+v %v", report, err)
 	}
-	// Put the same definition in the past without a timing-dependent test sleep.
+	// Переносим время закрытия в прошлое, чтобы сразу проверить повторный запрос после эфира.
 	spec.ClosesAt = now.Add(-time.Second)
 	if _, err := db.Exec(ctx, "UPDATE polls SET closes_at=$2 WHERE id=$1", poll.ID, spec.ClosesAt); err != nil {
 		t.Fatal(err)
@@ -156,8 +163,8 @@ func TestDraftPublicationAndRecovery(t *testing.T) {
 	if err != nil || report.Status != "finalizing" || report.Ballots != nil {
 		t.Fatalf("closing report: %+v %v", report, err)
 	}
-	if _, err := db.Exec(ctx, `INSERT INTO poll_results (poll_id,version,algorithm,ballots,counts)
-		VALUES ($1,1,$2,0,'{"1":0,"2":0}')`, poll.ID, resultsrepo.AlgorithmVersion); err != nil {
+	if _, err := db.Exec(ctx, `INSERT INTO poll_results (poll_id,ballots,counts)
+		VALUES ($1,0,'{"1":0,"2":0}')`, poll.ID); err != nil {
 		t.Fatal(err)
 	}
 	unfinished, err = repo.LoadUnfinished(ctx)
