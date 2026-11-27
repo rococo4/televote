@@ -1,4 +1,4 @@
-"""Render architecture.png from the repository root or any working directory (Pillow)."""
+"""Строит схему сервиса и сохраняет architecture.png в корне репозитория."""
 
 from math import atan2, cos, hypot, sin
 from pathlib import Path
@@ -92,19 +92,19 @@ def group(box, fill, outline, title, subtitle, color):
 
 
 label(44, 43, "Архитектура телеголосования", 39, ink, True)
-label(45, 88, "100 млн голосов за 60 секунд", 23, muted)
+label(45, 88, "Целевая конфигурация для 100 млн зрителей за 60 секунд", 23, muted)
 
 group((40, 126, 1472, 480), "#fafbfd", "#d5dce2",
       "Приём во время эфира",
       "Расчётный пик с повторами — 3,67 млн POST/с. При совпадении с пиком GET — 7 млн HTTP-запросов/с.", ink)
 group((40, 508, 875, 784), "#f5f8fd", "#cbdbea",
       "Создание опроса и просмотр результатов",
-      "Редактор задаёт вопрос и границы окна голосования.", cold)
+      "Администратор задаёт вопрос и время голосования.", cold)
 group((899, 508, 1472, 784), "#f3faf8", "#bdded6",
       "Подсчёт после закрытия",
       "Цель — опубликовать результат в течение 5 минут.", tally)
 
-# Public route handlers are roles of the same Go application.
+# Общая рамка показывает, что выдачу вопроса и приём голоса обслуживает один Go-сервис.
 rectangle((526, 211, 941, 424), "#ffffff", "#82929e", 14)
 label(733, 234, "Пул экземпляров Go API", 22, ink, True, "mm")
 arrow([(205, 321), (253, 321)], muted)
@@ -115,7 +115,7 @@ arrow([(921, 377), (1092, 377)], hot)
 
 node((62, 280, 205, 361), "Зритель", "браузер", cold)
 node((253, 280, 459, 361), "Балансировщик", "HTTPS", muted, large=22)
-node((546, 255, 921, 325), "GET /p/{id}", "Форма опроса из памяти", cold, "#edf5fc")
+node((546, 255, 921, 325), "GET /api/polls/{id}", "Вопрос, варианты и cookie", cold, "#edf5fc")
 node((546, 342, 921, 413), "POST /api/polls/{id}/votes",
      "202 после подтверждения Kafka", hot, "#fff3e1", large=22)
 label(1007, 357, "событие", 17, hot, True, "mm")
@@ -126,24 +126,26 @@ label(1255, 311, "Apache Kafka", 26, ink, True, "mm")
 label(1255, 347, "Партиции журнала голосов", 19, muted, False, "mm")
 label(1255, 383, "RF = 3   ·   min ISR = 2", 18, hot, False, "mm")
 
-# Publish once before the broadcast; read bounded input only after it ends.
-arrow([(467, 644), (467, 608), (725, 608), (725, 424)], cold, 2, True)
-label(741, 452, "версия опроса до эфира", 16, cold)
-arrow([(1418, 349), (1443, 349), (1443, 672), (1401, 672)], tally)
+# До эфира API получает параметры опроса. После закрытия обработчики читают голоса до маркера CLOSE.
+arrow([(725, 626), (725, 424)], cold, 2, True, twoway=True)
+label(741, 452, "правила опроса и учёт писателей", 16, cold)
+arrow([(1418, 349), (1443, 349), (1443, 672), (1401, 672)], tally, twoway=True)
+label(1425, 452, "запись CLOSE и чтение журнала", 16, tally, anchor="rm")
 
-# Both types of aggregate are written to the same PostgreSQL store.
+# Админка читает общий итог из той же базы, куда обработчики записывают итоги партиций.
 arrow([(227, 684), (294, 684)], cold)
 arrow([(510, 684), (572, 684)], cold, twoway=True)
-arrow([(963, 684), (853, 684)], tally)
-label(908, 664, "итоги", 17, tally, True, "mm")
+arrow([(963, 684), (853, 684)], tally, twoway=True)
+label(908, 659, "решение", 15, tally, True, "mm")
+label(908, 706, "и итоги", 15, tally, True, "mm")
 
-node((64, 644, 227, 725), "Редактор", "админка", cold)
+node((64, 644, 227, 725), "Администратор", "HTTP-клиент", cold, large=18)
 node((294, 644, 510, 725), "Admin API", "опрос и отчёт", cold)
 database((572, 626, 853, 741), "PostgreSQL", "опросы и агрегаты", cold, large=23, small=18)
 
 rectangle((963, 597, 1401, 754), "#ffffff", tally, 13)
-label(1182, 620, "Обработчики на Go", 23, ink, True, "mm")
-label(1182, 650, "Чтение заданных диапазонов партиций", 18, muted, False, "mm")
+label(1182, 620, "Подсчёт в репликах Go API", 23, ink, True, "mm")
+label(1182, 650, "Kafka назначает партиции участникам группы", 18, muted, False, "mm")
 label(1182, 678, "Последний допустимый голос по ключу зрителя", 18, muted, False, "mm")
 draw.line([(982 * SCALE, 701 * SCALE), (1381 * SCALE, 701 * SCALE)],
           fill="#bdded6", width=2 * SCALE)

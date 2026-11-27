@@ -1,0 +1,89 @@
+Нагрузочный прогон Televote, 27 ноября 2026 года
+
+Команда из корня проекта
+go test -tags=integration,load -run '^TestSubmitVoteLoad$' -count=1 -v -timeout=3m ./tests/integration
+
+Стенд замера
+macOS 27.0.1 arm64, Apple M2 Pro, 12 ядер, 32 ГиБ памяти, Go 1.26.0.
+На одной машине работали генератор и один HTTP-сервер (в одном Go-процессе),
+один PostgreSQL 17.12 и один Apache Kafka 4.1.2 в режиме KRaft (OpenJDK 25.0.4).
+Зависимости запущены нативно. DATABASE_URL и KAFKA_BROKERS указывали на эти
+локальные процессы. Для стенда из README та же команда использует адреса Compose
+по умолчанию. В топике четыре партиции, replication.factor=1, min.insync.replicas=1.
+В замере group.initial.rebalance.delay.ms=0. Интеграционные и сквозные тесты
+запускаются отдельно от генератора.
+
+Попытка 1
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=14237 dropped=763 statuses=map[202:14237] transport_or_response_errors=0 accepted=14237 elapsed=15.044022166s attempted/s=946.4 accepted/s=946.4 p95=2.995917ms p99=6.441042ms
+    submit_vote_load_test.go:105: phase 15s: accepted 14237 of 15000 offered, first transport/response error: <nil>
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45s attempted/s=333.3 accepted/s=333.3 p95=3.681833ms p99=4.751833ms
+    submit_vote_load_test.go:115: final: 26580 ballots, counts map[1:13291 2:13289]; expected map[1:13637 2:13636]
+    submit_vote_load_test.go:121: PostgreSQL: 26580 ballots, A=13291 B=13289, observed final 1.907980334s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 29237 votes and 4 close markers across 4 partitions, 26580 distinct voter keys
+--- FAIL: TestSubmitVoteLoad (72.09s)
+FAIL
+FAIL	github.com/rococo4/televote/tests/integration	73.093s
+FAIL
+
+Попытка 2, тот же профиль
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=10488 dropped=4512 statuses=map[202:10359 500:129] transport_or_response_errors=0 accepted=10359 elapsed=15.049174291s attempted/s=696.9 accepted/s=688.3 p95=2.649583ms p99=4.456767875s
+    submit_vote_load_test.go:105: phase 15s: accepted 10359 of 15000 offered, first transport/response error: <nil>
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45.0255185s attempted/s=333.1 accepted/s=333.1 p95=3.348667ms p99=4.18075ms
+    submit_vote_load_test.go:115: final: 23055 ballots, counts map[1:11526 2:11529]; expected map[1:13637 2:13636]
+    submit_vote_load_test.go:121: PostgreSQL: 23055 ballots, A=11526 B=11529, observed final 1.89402775s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 25359 votes and 4 close markers across 4 partitions, 23055 distinct voter keys
+--- FAIL: TestSubmitVoteLoad (72.03s)
+FAIL
+FAIL	github.com/rococo4/televote/tests/integration	73.045s
+FAIL
+
+Попытка 3, после исправления подготовки топика в интеграционном тесте
+
+Фикстура вызывает EnsureTopic, как при создании опроса через API, и проверяет
+доступность метаданных Kafka до начала сценария. Профиль и критерии те же.
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=10414 dropped=4586 statuses=map[202:10284 500:130] transport_or_response_errors=0 accepted=10284 elapsed=15.060991583s attempted/s=691.5 accepted/s=682.8 p95=3.555625ms p99=4.520772834s
+    submit_vote_load_test.go:105: phase 15s: accepted 10284 of 15000 offered, first transport/response error: <nil>
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45.036769584s attempted/s=333.1 accepted/s=333.1 p95=3.93525ms p99=5.038833ms
+    submit_vote_load_test.go:115: final: 22985 ballots, counts map[1:11495 2:11490]; expected map[1:13637 2:13636]
+    submit_vote_load_test.go:121: PostgreSQL: 22985 ballots, A=11495 B=11490, observed final 1.891795666s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 25284 votes and 4 close markers across 4 partitions, 22985 distinct voter keys
+--- FAIL: TestSubmitVoteLoad (72.03s)
+FAIL
+FAIL	github.com/rococo4/televote/tests/integration	72.606s
+FAIL
+
+Попытка 4, диагностическая. Вывод и трасса приведены в load-diagnostic.txt.
+
+Попытка 5, контрольная после настройки MetadataMinAge в 50 мс
+
+Обычный тест без трассировки. Команда, профиль и критерии совпадают с первыми
+тремя попытками. При каждом запуске тест создаёт новый опрос и Kafka-топик.
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=15.005897916s attempted/s=999.6 accepted/s=999.6 p95=2.855375ms p99=3.79175ms
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45.025710041s attempted/s=333.1 accepted/s=333.1 p95=3.531875ms p99=4.38225ms
+    submit_vote_load_test.go:121: PostgreSQL: 27273 ballots, A=13637 B=13636, observed final 1.884455417s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 30000 votes and 4 close markers across 4 partitions, 27273 distinct voter keys
+--- PASS: TestSubmitVoteLoad (72.01s)
+PASS
+ok  	github.com/rococo4/televote/tests/integration	73.054s
+
+Попытка 6, второй контрольный прогон с MetadataMinAge в 50 мс
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=14840 dropped=160 statuses=map[202:14840] transport_or_response_errors=0 accepted=14840 elapsed=15.014630708s attempted/s=988.4 accepted/s=988.4 p95=2.900417ms p99=5.319917ms
+    submit_vote_load_test.go:105: phase 15s: accepted 14840 of 15000 offered, first transport/response error: <nil>
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45.015658916s attempted/s=333.2 accepted/s=333.2 p95=3.454375ms p99=4.209375ms
+    submit_vote_load_test.go:115: final: 27127 ballots, counts map[1:13564 2:13563]; expected map[1:13637 2:13636]
+    submit_vote_load_test.go:121: PostgreSQL: 27127 ballots, A=13564 B=13563, observed final 1.886531333s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 29840 votes and 4 close markers across 4 partitions, 27127 distinct voter keys
+--- FAIL: TestSubmitVoteLoad (72.01s)
+FAIL
+FAIL	github.com/rococo4/televote/tests/integration	72.954s
+FAIL

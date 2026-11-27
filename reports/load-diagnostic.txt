@@ -1,0 +1,64 @@
+Диагностика записи в новый Kafka-топик, 27 ноября 2026 года
+
+Та же машина, фикстура, две фазы и критерии, что и в load-test.txt. Код коммита
+0d5ebae инструментирован через временный go test -overlay. В этой версии
+franz-go v1.22.1 использовал стандартный интервал MetadataMinAge в 5 секунд.
+
+Писатель записывал относительное время клиентских сообщений Kafka, постановки
+голоса на отправку, ответа в callback и завершения ожидания по тайм-ауту.
+Подробные сообщения Kafka сохранялись первые 8 секунд. События голосования
+выбирались по порядковому номеру (первые восемь и затем каждая тысяча),
+ошибке или задержке callback от секунды. Интервал 0,000 отсчитывается от
+инициализации диагностического кода. seq обозначает номер локальной отправки.
+
+Как воспроизвести на стенде из README с уже запущенными PostgreSQL и Kafka.
+Команды из корня проекта распакуют коммит в отдельный временный каталог и
+применят туда тот же диагностический код из load-diagnostic.patch.
+
+project=$(pwd)
+trial=$(mktemp -d)
+git archive 0d5ebae | tar -x -C "$trial"
+(
+  cd "$trial" &&
+  git apply --no-index --unidiff-zero "$project/reports/load-diagnostic.patch" &&
+  TELEVOTE_DIAG_LOG="$trial/kafka-trace.txt" go test -tags=integration,load \
+    -run '^TestSubmitVoteLoad$' -count=1 -v -timeout=3m ./tests/integration
+)
+
+Выдержка из трассы. Во время первых записей брокер сообщил клиенту, что ещё
+не обслуживает запись в партиции 0, 1 и 2. В партиции 3 запись удалась.
+Клиент запланировал повтор, для партиции 0 дождался обновления метаданных
+через 5 с. К этому моменту ожидание отправки № 2 исчерпало её срок в 5 с.
+В полном журнале 128 вызовов callback с context deadline exceeded. Сервер
+вернул 128 ответов HTTP 500. После обновления метаданных партиция 0 приняла запись.
+
+    0.072913 VOTE submit seq=1 duration=292ns err=<nil>
+    0.073283 VOTE submit seq=2 duration=167ns err=<nil>
+    0.075823 KAFKA INFO producer id initialization success [id 3023 epoch 0]
+    0.086126 KAFKA DEBUG rewinding produce sequence to resend pending batches [topic televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5 partition 0 rewind_from 2 rewind_to 0 pending_batches 2]
+    0.086155 KAFKA DEBUG retry batches processed [wanted_metadata_update true triggering_metadata_update true should_backoff false]
+    0.086166 KAFKA DEBUG produced [broker 1 to televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5[0{retrying@-1,2(NOT_LEADER_FOR_PARTITION: This server is not the leader for that topic-partition.)}, 3{0=>2}]]
+    0.086150 VOTE callback seq=1 duration=13.237959ms err=<nil>
+    0.086509 KAFKA DEBUG produced [broker 1 to televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5[2{retrying@-1,3(NOT_LEADER_FOR_PARTITION: This server is not the leader for that topic-partition.)}, 1{retrying@-1,2(NOT_LEADER_FOR_PARTITION: This server is not the leader for that topic-partition.)}]]
+    5.073337 VOTE wait cancelled seq=2 duration=5.00005425s err=context deadline exceeded
+    5.073603 KAFKA DEBUG wrote Metadata v13 [broker seed_0 bytes_written 88 write_wait 19.792µs time_to_write 20.208µs err <nil>]
+    5.074292 KAFKA DEBUG read Metadata v13 [broker seed_0 bytes_read 243 read_wait 81.875µs time_to_read 622µs err <nil>]
+    5.074372 KAFKA DEBUG metadata refresh has identical topic partition data [topic televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5 partition 0 leader 1 leader_epoch 0]
+    5.074440 KAFKA DEBUG rewinding produce sequence to resend pending batches [topic televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5 partition 0 rewind_from 0 rewind_to 0 pending_batches 2]
+    5.074460 VOTE callback seq=2 duration=5.001177292s err=context deadline exceeded
+    5.074509 VOTE callback seq=4 duration=4.999249042s err=context deadline exceeded
+    5.078152 KAFKA DEBUG produced [broker 1 to televote-it-d7663482-a2f8-460a-9140-0f8ddf5ab5b5[0{0=>1}, 1{114=>116}]]
+
+Полный вывод go test
+
+=== RUN   TestSubmitVoteLoad
+    submit_vote_load_test.go:105: phase=15s offered=15000 attempted=10474 dropped=4526 statuses=map[202:10346 500:128] transport_or_response_errors=0 accepted=10346 elapsed=15.026527375s attempted/s=697.0 accepted/s=688.5 p95=2.958875ms p99=4.529065458s
+    submit_vote_load_test.go:105: phase 15s: accepted 10346 of 15000 offered, first transport/response error: <nil>
+    submit_vote_load_test.go:105: phase=45s offered=15000 attempted=15000 dropped=0 statuses=map[202:15000] transport_or_response_errors=0 accepted=15000 elapsed=45s attempted/s=333.3 accepted/s=333.3 p95=3.465875ms p99=4.177291ms
+    submit_vote_load_test.go:115: final: 23043 ballots, counts map[1:11531 2:11512]; expected map[1:13637 2:13636]
+    submit_vote_load_test.go:121: PostgreSQL: 23043 ballots, A=11531 B=11512, observed final 1.877737s after poll deadline
+    submit_vote_load_test.go:124: Kafka: 25346 votes and 4 close markers across 4 partitions, 23043 distinct voter keys
+--- FAIL: TestSubmitVoteLoad (72.01s)
+FAIL
+FAIL	github.com/rococo4/televote/tests/integration	73.535s
+FAIL

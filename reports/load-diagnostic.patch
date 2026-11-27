@@ -1,0 +1,46 @@
+--- a/internal/adapter/kafka/producer.go
++++ b/internal/adapter/kafka/producer.go
+@@ -8,0 +9 @@
++	"os"
+@@ -10,0 +12 @@
++	"sync/atomic"
+@@ -17,0 +20,29 @@
++
++var diagnosticStart = time.Now()
++var diagnosticCalls atomic.Uint64
++var diagnosticOutput = func() *os.File {
++	f, err := os.Create(os.Getenv("TELEVOTE_DIAG_LOG"))
++	if err != nil {
++		panic(err)
++	}
++	return f
++}()
++
++type timingLog struct{}
++
++func (timingLog) Level() kgo.LogLevel {
++	if time.Since(diagnosticStart) <= 16*time.Second {
++		return kgo.LogLevelDebug
++	}
++	return kgo.LogLevelInfo
++}
++func (timingLog) Log(level kgo.LogLevel, msg string, kv ...any) {
++	if time.Since(diagnosticStart) <= 8*time.Second || level <= kgo.LogLevelInfo {
++		fmt.Fprintf(diagnosticOutput, "%12.6f KAFKA %s %s %v\n", time.Since(diagnosticStart).Seconds(), level, msg, kv)
++	}
++}
++func diagnosticVote(seq uint64, step string, start time.Time, err error) {
++	if seq <= 8 || seq%1000 == 0 || err != nil || (step == "callback" && time.Since(start) >= time.Second) {
++		fmt.Fprintf(diagnosticOutput, "%12.6f VOTE %s seq=%d duration=%v err=%v\n", time.Since(diagnosticStart).Seconds(), step, seq, time.Since(start), err)
++	}
++}
+@@ -29,0 +61 @@
++		kgo.WithLogger(timingLog{}),
+@@ -93,0 +126,3 @@
++	started := time.Now()
++	seq := diagnosticCalls.Add(1)
++	diagnosticVote(seq, "submit", started, nil)
+@@ -94,0 +130 @@
++		diagnosticVote(seq, "callback", started, err)
+@@ -103,0 +140 @@
++		diagnosticVote(seq, "wait cancelled", started, ctx.Err())
