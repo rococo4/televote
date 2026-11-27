@@ -7,7 +7,7 @@ paths:
     get:
       operationId: getPublicPoll
       summary: Получить вопрос и варианты ответа
-      description: До закрытия опроса сервер также выдаёт браузеру cookie для голосования.
+      description: До закрытия опроса браузер получает cookie для голосования.
       parameters:
         - name: id
           in: path
@@ -35,7 +35,7 @@ paths:
     post:
       operationId: submitVote
       summary: Анонимно отправить бюллетень
-      description: Пока опрос открыт, можно заменить свой ответ, отправив новый набор вариантов.
+      description: Пока опрос открыт, можно отправить новый выбор целиком.
       parameters:
         - name: id
           in: path
@@ -64,7 +64,7 @@ paths:
                   uniqueItems: true
                   items:
                     type: integer
-                  description: Полный список ID выбранных вариантов ответа.
+                  description: ID всех выбранных вариантов.
             example:
               choices: [2]
       responses:
@@ -113,7 +113,7 @@ paths:
                   id: {type: string, format: uuid}
         '400':
           $ref: '#/components/responses/BadRequest'
-          description: Некорректный запрос или ID опроса занят другими параметрами.
+          description: Ошибка в запросе или этот ID уже занят опросом с другими параметрами.
         '401': {$ref: '#/components/responses/Unauthorized'}
         '500': {$ref: '#/components/responses/InternalError'}
   /admin/polls/{id}/results:
@@ -218,14 +218,14 @@ components:
         id:
           type: string
           format: uuid
-          description: Ненулевой UUID опроса. Если поле пропущено, сервис назначит ID.
+          description: Ненулевой UUID. Если поле пропустить, сервис сам назначит ID.
         question: {type: string, minLength: 1}
         choices:
           type: array
           minItems: 2
           uniqueItems: true
           items: {type: string, minLength: 1}
-          description: Названия вариантов в порядке показа. Без пробелов по краям они должны быть непустыми и уникальными.
+          description: Названия в порядке показа. Пробелы по краям игнорируются. Пустые названия и повторы запрещены.
         min_choices: {type: integer, minimum: 1}
         max_choices:
           type: integer
@@ -266,7 +266,7 @@ components:
                 type: [number, 'null']
                 minimum: 0
                 maximum: 100
-                description: Процент бюллетеней с этим вариантом. Если бюллетеней нет, значение равно null.
+                description: Процент бюллетеней с этим вариантом. Если бюллетеней нет — null.
     Error:
       type: object
       required: [code, message]
