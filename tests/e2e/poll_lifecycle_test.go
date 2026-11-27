@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -343,44 +344,9 @@ type replica struct {
 func replicaStarter(t *testing.T) func(time.Duration) replica {
 	t.Helper()
 	brokers := strings.Split(setting("KAFKA_BROKERS", "127.0.0.1:59092"), ",")
-	cfg, err := pgxpool.ParseConfig(setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	schema := pgx.Identifier{"televote_e2e_" + uuid.NewString()}.Sanitize()
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema
-	db, err := pgxpool.NewWithConfig(t.Context(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(db.Close)
-	if _, err := db.Exec(t.Context(), "CREATE SCHEMA "+schema); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if _, err := db.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
-			t.Errorf("remove test schema: %v", err)
-		}
-	})
-	files, err := filepath.Glob("../../internal/migrations/postgres/*.sql")
-	if err != nil || len(files) == 0 {
-		t.Fatalf("find migrations: %v, found %v", err, files)
-	}
-	for _, path := range files {
-		sql, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.Exec(t.Context(), string(sql)); err != nil {
-			t.Fatalf("apply %s: %v", path, err)
-		}
-	}
-	t.Cleanup(func() { deleteTestTopics(t, db, brokers) })
-
+	dsn := isolatedDatabase(t, brokers)
 	return func(grace time.Duration) replica {
-		pool, err := pgxpool.NewWithConfig(t.Context(), cfg.Copy())
+		pool, err := pgxpool.New(t.Context(), dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -412,6 +378,56 @@ func replicaStarter(t *testing.T) func(time.Duration) replica {
 		t.Cleanup(stop)
 		return replica{server, stop}
 	}
+}
+
+// Каждая проверка получает свою схему и удаляет только созданные в ней топики.
+func isolatedDatabase(t *testing.T, brokers []string) string {
+	t.Helper()
+	dsn := setting("DATABASE_URL", "postgres://televote:televote@127.0.0.1:55432/televote?sslmode=disable")
+	name := "televote_e2e_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		address, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		options := address.Query()
+		options.Set("search_path", name)
+		address.RawQuery = options.Encode()
+		dsn = address.String()
+	} else {
+		dsn += " search_path=" + name
+	}
+	db, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	if _, err := db.Exec(t.Context(), "CREATE SCHEMA "+name); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := db.Exec(ctx, "DROP SCHEMA "+name+" CASCADE"); err != nil {
+			t.Errorf("remove test schema: %v", err)
+		}
+	})
+	files, err := filepath.Glob("../../internal/migrations/postgres/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("find migrations: %v, found %v", err, files)
+	}
+	for _, path := range files {
+		sql, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(t.Context(), string(sql)); err != nil {
+			t.Fatalf("apply %s: %v", path, err)
+		}
+	}
+	t.Cleanup(func() { deleteTestTopics(t, db, brokers) })
+
+	return dsn
 }
 
 func deleteTestTopics(t *testing.T, db *pgxpool.Pool, brokers []string) {

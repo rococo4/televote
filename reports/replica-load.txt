@@ -1,0 +1,24 @@
+27 ноября 2026 года, два отдельных процесса Televote за одним локальным балансировщиком.
+Команда: go test -tags=e2e,load -run '^TestTwoProcessVotingLoad$' -count=1 -v -timeout=2m ./tests/e2e
+
+Прогон 1
+
+=== RUN   TestTwoProcessVotingLoad
+    two_process_load_test.go:106: фаза=5s зрителей=1000 GET_200=[470 530] POST_202=[580 520] HTTP_успешных/с=420.0 POST_202/с=220.0 p95_POST=431.734667ms p99_POST=676.12425ms ошибок_сценария=0
+    two_process_load_test.go:106: фаза=15s зрителей=1000 GET_200=[500 500] POST_202=[550 550] HTTP_успешных/с=140.0 POST_202/с=73.3 p95_POST=4.492291ms p99_POST=5.169375ms ошибок_сценария=0
+    two_process_load_test.go:110: GET_200_по_репликам=[970 1030] POST_202_по_репликам=[1130 1070] смен_ответа_через_другую_реплику=190/200 ошибок_сценария=0
+    two_process_load_test.go:123: итог: 2000 бюллетеней, A=1800 B=200, наблюдался через 2.344308s после дедлайна
+--- PASS: TestTwoProcessVotingLoad (36.30s)
+PASS
+ok  	github.com/rococo4/televote/tests/e2e	36.842s
+
+Прогон 2
+
+=== RUN   TestTwoProcessVotingLoad
+    two_process_load_test.go:106: фаза=5s зрителей=1000 GET_200=[476 524] POST_202=[574 526] HTTP_успешных/с=420.0 POST_202/с=220.0 p95_POST=3.867792ms p99_POST=161.467042ms ошибок_сценария=0
+    two_process_load_test.go:106: фаза=15s зрителей=1000 GET_200=[500 500] POST_202=[550 550] HTTP_успешных/с=140.0 POST_202/с=73.3 p95_POST=4.476917ms p99_POST=5.022916ms ошибок_сценария=0
+    two_process_load_test.go:110: GET_200_по_репликам=[976 1024] POST_202_по_репликам=[1124 1076] смен_ответа_через_другую_реплику=197/200 ошибок_сценария=0
+    two_process_load_test.go:123: итог: 2000 бюллетеней, A=1800 B=200, наблюдался через 2.37725s после дедлайна
+--- PASS: TestTwoProcessVotingLoad (36.24s)
+PASS
+ok  	github.com/rococo4/televote/tests/e2e	36.862s
